@@ -1,0 +1,376 @@
+//  XR3DV - OpenXR Runtime for NVIDIA 3D Vision
+//  Copyright (C) 2026 XR3DV Contributors
+//  SPDX-License-Identifier: GPL-3.0-or-later
+//
+//  NVAPI stereo bridge: creates a hidden D3D9Ex device, enables NVAPI
+//  stereo mode, and blits D3D11 left/right eye textures into it each frame.
+
+#include "nvapi_stereo.h"
+#include "logging.h"
+
+// NVAPI SDK header — must be in include/nvapi/
+#include <nvapi.h>
+
+#include <d3d9.h>
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+#include <stdexcept>
+#include <cstring>
+#include <vector>
+
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+
+using Microsoft::WRL::ComPtr;
+
+namespace xr3dv {
+
+// ---------------------------------------------------------------------------
+// Hidden window for D3D9 presentation
+// ---------------------------------------------------------------------------
+static HWND CreateHiddenWindow() {
+    static const wchar_t kClass[] = L"XR3DV_D3D9";
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kClass;
+    RegisterClassExW(&wc); // ignore "already registered"
+
+    HWND hw = CreateWindowExW(
+        0, kClass, L"XR3DV", WS_POPUP,
+        0, 0, 1, 1,
+        nullptr, nullptr, wc.hInstance, nullptr);
+
+    ShowWindow(hw, SW_HIDE);
+    return hw;
+}
+
+// ---------------------------------------------------------------------------
+// NvapiStereoPresenter::Init
+// ---------------------------------------------------------------------------
+bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
+                                 float separation, float convergence)
+{
+    m_width  = width;
+    m_height = height;
+
+    // ------ 1. Initialise NVAPI ------------------------------------------
+    NvAPI_Status nvs = NvAPI_Initialize();
+    if (nvs != NVAPI_OK) {
+        NvAPI_ShortString errStr;
+        NvAPI_GetErrorMessage(nvs, errStr);
+        LOG_ERROR("NvAPI_Initialize failed: %s", errStr);
+        return false;
+    }
+
+    // ------ 2. Enable stereo globally ------------------------------------
+    nvs = NvAPI_Stereo_Enable();
+    if (nvs != NVAPI_OK) {
+        LOG_ERROR("NvAPI_Stereo_Enable failed (%d). "
+                  "Ensure 3D Vision is enabled in NVIDIA Control Panel.", nvs);
+        return false;
+    }
+
+    // ------ 3. Create D3D9Ex device --------------------------------------
+    if (!CreateD3D9Device(width, height)) return false;
+
+    // ------ 4. Create NVAPI stereo handle from the device ----------------
+    if (!EnableNvStereo()) return false;
+
+    // ------ 5. Create per-eye D3D9 offscreen surfaces --------------------
+    if (!CreateStagingResources(width, height)) return false;
+
+    // ------ 6. Apply initial parameters ----------------------------------
+    SetSeparation(separation);
+    SetConvergence(convergence);
+
+    m_initialised = true;
+    LOG_INFO("NvapiStereoPresenter initialised (%ux%u, sep=%.1f, conv=%.2f)",
+             width, height, separation, convergence);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height) {
+    m_hwnd = CreateHiddenWindow();
+    if (!m_hwnd) { LOG_ERROR("Failed to create hidden D3D9 window"); return false; }
+
+    HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
+    if (FAILED(hr)) { LOG_ERROR("Direct3DCreate9Ex failed: 0x%08X", hr); return false; }
+
+    D3DPRESENT_PARAMETERS pp{};
+    pp.BackBufferWidth          = width;
+    pp.BackBufferHeight         = height;
+    pp.BackBufferFormat         = D3DFMT_A8R8G8B8;
+    pp.BackBufferCount          = 1;
+    pp.SwapEffect               = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow            = m_hwnd;
+    pp.Windowed                 = TRUE;
+    pp.EnableAutoDepthStencil   = FALSE;
+    pp.PresentationInterval     = D3DPRESENT_INTERVAL_ONE;
+
+    hr = m_d3d9->CreateDeviceEx(
+        D3DADAPTER_DEFAULT,
+        D3DDEVTYPE_HAL,
+        m_hwnd,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        &pp, nullptr,
+        &m_device);
+
+    if (FAILED(hr)) {
+        LOG_ERROR("CreateDeviceEx failed: 0x%08X", hr);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+bool NvapiStereoPresenter::EnableNvStereo() {
+    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(),
+        reinterpret_cast<StereoHandle*>(&m_stereoHandle));
+    if (nvs != NVAPI_OK) {
+        LOG_ERROR("NvAPI_Stereo_CreateHandleFromIUnknown failed (%d)", nvs);
+        return false;
+    }
+    // Activate stereo
+    nvs = NvAPI_Stereo_Activate(reinterpret_cast<StereoHandle>(m_stereoHandle));
+    if (nvs != NVAPI_OK) {
+        LOG_ERROR("NvAPI_Stereo_Activate failed (%d)", nvs);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+bool NvapiStereoPresenter::CreateStagingResources(uint32_t width, uint32_t height) {
+    HRESULT hr;
+
+    // Offscreen plain surfaces for each eye (D3DPOOL_DEFAULT)
+    hr = m_device->CreateOffscreenPlainSurface(
+        width, height, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+        &m_leftSurface, nullptr);
+    if (FAILED(hr)) { LOG_ERROR("CreateOffscreenPlainSurface (left) failed: 0x%08X", hr); return false; }
+
+    hr = m_device->CreateOffscreenPlainSurface(
+        width, height, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+        &m_rightSurface, nullptr);
+    if (FAILED(hr)) { LOG_ERROR("CreateOffscreenPlainSurface (right) failed: 0x%08X", hr); return false; }
+
+    // Back buffer reference for StretchRect
+    hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBuffer);
+    if (FAILED(hr)) { LOG_ERROR("GetBackBuffer failed: 0x%08X", hr); return false; }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// PresentStereoFrame
+// ---------------------------------------------------------------------------
+bool NvapiStereoPresenter::PresentStereoFrame(
+    ID3D11ShaderResourceView* leftSRV,
+    ID3D11ShaderResourceView* rightSRV,
+    ID3D11Device*             d3d11Dev)
+{
+    if (!m_initialised) return false;
+
+    // Blit left eye --------------------------------------------------------
+    if (!BlitD3D11ToD3D9(leftSRV, d3d11Dev, m_leftSurface.Get())) return false;
+
+    // Tell NVAPI we're about to write the left eye
+    NvAPI_Stereo_SetActiveEye(
+        reinterpret_cast<StereoHandle>(m_stereoHandle),
+        NVAPI_STEREO_EYE_LEFT);
+
+    m_device->StretchRect(
+        m_leftSurface.Get(), nullptr,
+        m_backBuffer.Get(),  nullptr,
+        D3DTEXF_LINEAR);
+
+    // Blit right eye -------------------------------------------------------
+    if (!BlitD3D11ToD3D9(rightSRV, d3d11Dev, m_rightSurface.Get())) return false;
+
+    NvAPI_Stereo_SetActiveEye(
+        reinterpret_cast<StereoHandle>(m_stereoHandle),
+        NVAPI_STEREO_EYE_RIGHT);
+
+    m_device->StretchRect(
+        m_rightSurface.Get(), nullptr,
+        m_backBuffer.Get(),   nullptr,
+        D3DTEXF_LINEAR);
+
+    // Present the stereo frame ---------------------------------------------
+    HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D9 PresentEx failed: 0x%08X", hr);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// BlitD3D11ToD3D9 — CPU readback path
+//
+// GPU-to-GPU copy between D3D11 and D3D9 is not directly possible without
+// a shared resource handle.  We use a D3D11 STAGING texture for CPU read-
+// back, then lock a D3D9 SYSMEM surface and memcpy.
+//
+// For production use, replace with DXGI interop (IDXGIKeyedMutex / shared
+// handles) to avoid the CPU copy and its latency.
+// ---------------------------------------------------------------------------
+bool NvapiStereoPresenter::BlitD3D11ToD3D9(
+    ID3D11ShaderResourceView* srv,
+    ID3D11Device*             d3d11Dev,
+    IDirect3DSurface9*        dst)
+{
+    // ---- Resolve the SRV to a texture ------------------------------------
+    ComPtr<ID3D11Resource> res;
+    srv->GetResource(&res);
+    ComPtr<ID3D11Texture2D> srcTex;
+    if (FAILED(res.As(&srcTex))) {
+        LOG_ERROR("BlitD3D11ToD3D9: SRV resource is not a Texture2D");
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC srcDesc{};
+    srcTex->GetDesc(&srcDesc);
+
+    // ---- Ensure staging texture exists and matches dims ------------------
+    if (!m_stagingTex ||
+        m_stagingWidth  != srcDesc.Width ||
+        m_stagingHeight != srcDesc.Height)
+    {
+        m_stagingTex.Reset();
+        m_stagingWidth  = srcDesc.Width;
+        m_stagingHeight = srcDesc.Height;
+
+        D3D11_TEXTURE2D_DESC stDesc{};
+        stDesc.Width          = srcDesc.Width;
+        stDesc.Height         = srcDesc.Height;
+        stDesc.MipLevels      = 1;
+        stDesc.ArraySize      = 1;
+        stDesc.Format         = DXGI_FORMAT_B8G8R8A8_UNORM; // matches D3D9 BGRA
+        stDesc.SampleDesc     = {1, 0};
+        stDesc.Usage          = D3D11_USAGE_STAGING;
+        stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ComPtr<ID3D11Device> dev = d3d11Dev;
+        if (FAILED(dev->CreateTexture2D(&stDesc, nullptr, &m_stagingTex))) {
+            LOG_ERROR("Failed to create D3D11 staging texture");
+            return false;
+        }
+    }
+
+    // ---- Copy D3D11 tex → staging ----------------------------------------
+    ComPtr<ID3D11DeviceContext> ctx;
+    d3d11Dev->GetImmediateContext(&ctx);
+
+    // If the source format differs (e.g. RGBA not BGRA), a full CopyResource
+    // may require a CS conversion pass.  For simplicity we assume the OpenXR
+    // app is using BGRA or RGBA and the GPU driver handles it; if not, add a
+    // pixel shader blit here.
+    ctx->CopyResource(m_stagingTex.Get(), srcTex.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = ctx->Map(m_stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) { LOG_ERROR("D3D11 Map staging failed: 0x%08X", hr); return false; }
+
+    // ---- Lock D3D9 SYSMEM surface and copy row by row --------------------
+    // We use an intermediate SYSMEM surface for the lock.
+    ComPtr<IDirect3DSurface9> sysSurf;
+    HRESULT hrd = m_device->CreateOffscreenPlainSurface(
+        m_stagingWidth, m_stagingHeight,
+        D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+        &sysSurf, nullptr);
+
+    if (FAILED(hrd)) {
+        ctx->Unmap(m_stagingTex.Get(), 0);
+        LOG_ERROR("CreateOffscreenPlainSurface (sysmem) failed: 0x%08X", hrd);
+        return false;
+    }
+
+    D3DLOCKED_RECT lr{};
+    hrd = sysSurf->LockRect(&lr, nullptr, D3DLOCK_DISCARD);
+    if (FAILED(hrd)) {
+        ctx->Unmap(m_stagingTex.Get(), 0);
+        LOG_ERROR("LockRect failed: 0x%08X", hrd);
+        return false;
+    }
+
+    const uint8_t* src  = reinterpret_cast<const uint8_t*>(mapped.pData);
+    uint8_t*       dstP = reinterpret_cast<uint8_t*>(lr.pBits);
+    size_t rowBytes = static_cast<size_t>(m_stagingWidth) * 4;
+
+    for (uint32_t row = 0; row < m_stagingHeight; ++row) {
+        memcpy(dstP + row * lr.Pitch,
+               src  + row * mapped.RowPitch,
+               rowBytes);
+    }
+
+    sysSurf->UnlockRect();
+    ctx->Unmap(m_stagingTex.Get(), 0);
+
+    // ---- UpdateSurface: SYSMEM → DEFAULT pool ----------------------------
+    hrd = m_device->UpdateSurface(sysSurf.Get(), nullptr, dst, nullptr);
+    if (FAILED(hrd)) {
+        LOG_ERROR("UpdateSurface failed: 0x%08X", hrd);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Hot-reload helpers
+// ---------------------------------------------------------------------------
+void NvapiStereoPresenter::SetSeparation(float pct) {
+    if (!m_stereoHandle) return;
+    NvAPI_Stereo_SetSeparation(
+        reinterpret_cast<StereoHandle>(m_stereoHandle), pct);
+    LOG_VERBOSE("Stereo separation set to %.1f%%", pct);
+}
+
+void NvapiStereoPresenter::SetConvergence(float val) {
+    if (!m_stereoHandle) return;
+    NvAPI_Stereo_SetConvergence(
+        reinterpret_cast<StereoHandle>(m_stereoHandle), val);
+    LOG_VERBOSE("Stereo convergence set to %.2f", val);
+}
+
+// ---------------------------------------------------------------------------
+NvapiStereoPresenter::~NvapiStereoPresenter() {
+    m_backBuffer.Reset();
+    m_leftSurface.Reset();
+    m_rightSurface.Reset();
+    m_stagingTex.Reset();
+
+    if (m_stereoHandle) {
+        NvAPI_Stereo_DestroyHandle(
+            reinterpret_cast<StereoHandle>(m_stereoHandle));
+        m_stereoHandle = nullptr;
+    }
+
+    m_device.Reset();
+    m_d3d9.Reset();
+
+    if (m_hwnd) {
+        DestroyWindow(m_hwnd);
+        m_hwnd = nullptr;
+    }
+
+    NvAPI_Unload();
+}
+
+// ---------------------------------------------------------------------------
+bool NvapiIsAvailable() {
+    NvAPI_Status s = NvAPI_Initialize();
+    if (s != NVAPI_OK) return false;
+    NvU8 isStereoEnabled = 0;
+    NvAPI_Stereo_IsEnabled(&isStereoEnabled);
+    NvAPI_Unload();
+    return isStereoEnabled != 0;
+}
+
+} // namespace xr3dv

@@ -1,0 +1,38 @@
+; XR3DV Configuration File
+; ========================
+; Place this file next to xr3dv.dll as "xr3dv.ini"
+; Changes to [Stereo] Separation and Convergence are hot-reloaded
+; without restarting the application (polled every 500ms).
+
+[Display]
+; Per-eye render resolution in pixels.
+; Larger values improve sharpness but increase GPU load.
+Width=1920
+Height=1080
+
+; Target display refresh rate in Hz.
+; Should match your monitor and 3D Vision emitter frequency.
+; Common values: 60, 100, 120 (3D Vision requires 120 Hz in stereo mode)
+FrameRate=120
+
+[Stereo]
+; Eye separation as a percentage [0.0 – 100.0].
+; Higher values push objects further apart (stronger 3D depth effect).
+; Start around 30–60 and adjust for comfort.
+Separation=50.0
+
+; Convergence / zero-parallax point [0.0 – 25.0].
+; Controls where the stereo "screen plane" sits.
+; Lower = objects feel closer; higher = more depth behind the screen.
+Convergence=5.0
+
+; Interpupillary distance in metres [0.04 – 0.10].
+; The physical distance between your eyes.  Average adult: 0.064.
+IPD=0.064
+
+[Debug]
+; Log verbosity: 0=Off  1=Errors  2=Verbose
+LogLevel=1
+
+; Log file path.  Relative paths are resolved next to xr3dv.dll.
+LogFile=xr3dv.log

@@ -1,0 +1,41 @@
+//  XR3DV - OpenXR Runtime for NVIDIA 3D Vision
+//  Copyright (C) 2026 XR3DV Contributors
+//  SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "runtime.h"
+#include "logging.h"
+
+namespace xr3dv {
+
+static Runtime* g_runtime = nullptr;
+
+Runtime* GetRuntime() { return g_runtime; }
+
+bool RuntimeInit(Runtime** out) {
+    if (g_runtime) {
+        if (out) *out = g_runtime;
+        return true; // already initialised
+    }
+
+    auto* rt = new Runtime();
+
+    // Load config
+    std::string iniPath = GetDefaultIniPath();
+    LoadConfig(rt->cfg, iniPath);
+
+    // Initialise logging
+    LogInit(rt->cfg.logFile, static_cast<LogLevel>(rt->cfg.logLevel));
+
+    g_runtime = rt;
+    if (out) *out = rt;
+    LOG_INFO("XR3DV runtime initialised (v%d.%d.%d)",
+             XR3DV_VERSION_MAJOR, XR3DV_VERSION_MINOR, XR3DV_VERSION_PATCH);
+    return true;
+}
+
+void RuntimeDestroy() {
+    delete g_runtime;
+    g_runtime = nullptr;
+}
+
+} // namespace xr3dv

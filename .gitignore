@@ -1,0 +1,14 @@
+build/
+.vs/
+*.user
+*.suo
+*.aps
+CMakeSettings.json
+out/
+
+# NVAPI SDK (must be obtained separately)
+include/nvapi/
+
+# Log files
+*.log
+xr3dv.ini
