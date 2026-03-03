@@ -6,8 +6,6 @@
 #include "config.h"
 #include "logging.h"
 
-#pragma comment(lib, "shlwapi.lib")
-
 namespace xr3dv {
 
 // ---------------------------------------------------------------------------

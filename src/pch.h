@@ -17,6 +17,8 @@
 #  define NOMINMAX
 #endif
 #include <windows.h>
+#include <shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
 
 // ---- DirectX (order matters) --------------------------------------------
 #include <d3d9.h>
