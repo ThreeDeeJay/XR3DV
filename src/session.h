@@ -4,9 +4,15 @@
 
 #pragma once
 
+// D3D11 headers MUST come before openxr_platform.h, which gates the
+// XrGraphicsBindingD3D11KHR family on XR_USE_GRAPHICS_API_D3D11.
+#ifndef XR_USE_GRAPHICS_API_D3D11
+#  define XR_USE_GRAPHICS_API_D3D11
+#endif
+#include <windows.h>
+#include <d3d11.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <d3d11.h>
 #include <wrl/client.h>
 #include <memory>
 #include <mutex>

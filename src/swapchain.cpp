@@ -10,7 +10,7 @@ namespace xr3dv {
 bool Swapchain::Init(ID3D11Device* dev, const XrSwapchainCreateInfo& ci) {
     m_width  = ci.width;
     m_height = ci.height;
-    m_format = ci.format; // DXGI_FORMAT cast
+    m_format = static_cast<uint32_t>(ci.format); // DXGI_FORMAT cast
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width          = ci.width;

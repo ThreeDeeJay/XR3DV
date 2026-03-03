@@ -9,10 +9,9 @@
 #include <wrl/client.h>
 #include <cstdint>
 
-// Forward declare NVAPI types to avoid requiring the full header here.
-// The .cpp will include nvapi.h properly.
-struct _NVDX_ObjectHandle;
-typedef struct _NVDX_ObjectHandle* NVDX_ObjectHandle;
+// nvapi.h defines StereoHandle, NVDX_ObjectHandle, etc.
+// It must be included before any NVAPI type usage.
+#include <nvapi.h>
 
 namespace xr3dv {
 
@@ -78,7 +77,7 @@ private:
     uint32_t m_stagingHeight = 0;
 
     // ------ NVAPI ---------------------------------------------------------
-    void*    m_stereoHandle  = nullptr;   // StereoHandle (opaque)
+    StereoHandle m_stereoHandle  = nullptr;   ///< NVAPI stereo handle
 
     // ------ State ---------------------------------------------------------
     bool     m_initialised   = false;

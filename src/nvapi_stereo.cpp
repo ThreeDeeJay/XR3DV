@@ -8,9 +8,6 @@
 #include "nvapi_stereo.h"
 #include "logging.h"
 
-// NVAPI SDK header — must be in include/nvapi/
-#include <nvapi.h>
-
 #include <d3d9.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -130,14 +127,13 @@ bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height) {
 
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::EnableNvStereo() {
-    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(),
-        reinterpret_cast<StereoHandle*>(&m_stereoHandle));
+    nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
     if (nvs != NVAPI_OK) {
         LOG_ERROR("NvAPI_Stereo_CreateHandleFromIUnknown failed (%d)", nvs);
         return false;
     }
     // Activate stereo
-    nvs = NvAPI_Stereo_Activate(reinterpret_cast<StereoHandle>(m_stereoHandle));
+    nvs = NvAPI_Stereo_Activate(m_stereoHandle);
     if (nvs != NVAPI_OK) {
         LOG_ERROR("NvAPI_Stereo_Activate failed (%d)", nvs);
         return false;
@@ -181,9 +177,7 @@ bool NvapiStereoPresenter::PresentStereoFrame(
     if (!BlitD3D11ToD3D9(leftSRV, d3d11Dev, m_leftSurface.Get())) return false;
 
     // Tell NVAPI we're about to write the left eye
-    NvAPI_Stereo_SetActiveEye(
-        reinterpret_cast<StereoHandle>(m_stereoHandle),
-        NVAPI_STEREO_EYE_LEFT);
+    NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_LEFT);
 
     m_device->StretchRect(
         m_leftSurface.Get(), nullptr,
@@ -193,9 +187,7 @@ bool NvapiStereoPresenter::PresentStereoFrame(
     // Blit right eye -------------------------------------------------------
     if (!BlitD3D11ToD3D9(rightSRV, d3d11Dev, m_rightSurface.Get())) return false;
 
-    NvAPI_Stereo_SetActiveEye(
-        reinterpret_cast<StereoHandle>(m_stereoHandle),
-        NVAPI_STEREO_EYE_RIGHT);
+    NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
 
     m_device->StretchRect(
         m_rightSurface.Get(), nullptr,
@@ -327,15 +319,13 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
 // ---------------------------------------------------------------------------
 void NvapiStereoPresenter::SetSeparation(float pct) {
     if (!m_stereoHandle) return;
-    NvAPI_Stereo_SetSeparation(
-        reinterpret_cast<StereoHandle>(m_stereoHandle), pct);
+    NvAPI_Stereo_SetSeparation(m_stereoHandle, pct);
     LOG_VERBOSE("Stereo separation set to %.1f%%", pct);
 }
 
 void NvapiStereoPresenter::SetConvergence(float val) {
     if (!m_stereoHandle) return;
-    NvAPI_Stereo_SetConvergence(
-        reinterpret_cast<StereoHandle>(m_stereoHandle), val);
+    NvAPI_Stereo_SetConvergence(m_stereoHandle, val);
     LOG_VERBOSE("Stereo convergence set to %.2f", val);
 }
 
@@ -347,8 +337,7 @@ NvapiStereoPresenter::~NvapiStereoPresenter() {
     m_stagingTex.Reset();
 
     if (m_stereoHandle) {
-        NvAPI_Stereo_DestroyHandle(
-            reinterpret_cast<StereoHandle>(m_stereoHandle));
+        NvAPI_Stereo_DestroyHandle(m_stereoHandle);
         m_stereoHandle = nullptr;
     }
 
