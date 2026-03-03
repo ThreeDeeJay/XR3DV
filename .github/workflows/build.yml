@@ -9,6 +9,7 @@ env:
   Artifacts: build/Release
   Title: ${{github.event.repository.name}}
   DXSDK_DIR: C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\
+  VULKAN_SDK: C:\VulkanSDK\1.1.114.0
 
 on:
   push:
@@ -33,76 +34,15 @@ jobs:
         echo "CommitCount=$(git rev-list --count HEAD)" >> $env:GITHUB_ENV
         echo "CommitDate=$(git show -s --date=format:'%Y-%m-%d' --format=%cd)" >> $env:GITHUB_ENV
 
-    - name: Cache DirectX SDK
-      id: DXSDK_Jun10
-      uses: actions/cache@v4
+    - name: Cache Vulkan SDK
+      id: cache-vulkan-sdk
+      uses: actions/cache@v5
       with:
-        path: ${{env.DXSDK_DIR}}
-        key: DXSDK_Jun10
-    - name: Install DirectX SDK
-      if: steps.DXSDK_Jun10.outputs.cache-hit != 'true'
+        path: "C:\\VulkanSDK\\1.1.114.0"
+        key: VulkanSDK
+    - name: Install Vulkan SDK
+      if: steps.cache-vulkan-sdk.outputs.cache-hit != 'true'
       shell: powershell
       run: |
-        Invoke-WebRequest -Method Get -Uri https://download.microsoft.com/download/a/e/7/ae743f1f-632b-4809-87a9-aa1bb3458e31/DXSDK_Jun10.exe -OutFile DXSDK_Jun10.exe -UseBasicParsing
-        Start-Process -Wait ./DXSDK_Jun10.exe -ArgumentList "/U"
-    - name: Set DXSDK_DIR
-      run: echo "DXSDK_DIR=C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\" >> $env:GITHUB_ENV
-
-    - name: Install Dependencies
-      run: |
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi.h"					-o "include/nvapi/nvapi.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_interface.h"		-o "include/nvapi/nvapi_interface.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_common.h"		-o "include/nvapi/nvapi_lite_common.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_d3dext.h"		-o "include/nvapi/nvapi_lite_d3dext.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_salend.h"		-o "include/nvapi/nvapi_lite_salend.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_salstart.h"	-o "include/nvapi/nvapi_lite_salstart.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_sli.h"			-o "include/nvapi/nvapi_lite_sli.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_surround.h"	-o "include/nvapi/nvapi_lite_surround.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/NvApiDriverSettings.h"	-o "include/nvapi/NvApiDriverSettings.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvHLSLExtns.h"			-o "include/nvapi/nvHLSLExtns.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvHLSLExtnsInternal.h"	-o "include/nvapi/nvHLSLExtnsInternal.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvShaderExtnEnums.h"		-o "include/nvapi/nvShaderExtnEnums.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/amd64/nvapi64.lib"		-o "include/nvapi/nvapi64.lib"
-
-    - name: Configure
-      run: cmake -A "${{env.Platform}}" -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.Configuration}} #-DCMAKE_PREFIX_PATH=vcpkg\installed\x64-windows
-
-    - name: Build
-      run: cmake --build ${{github.workspace}}/build --config ${{env.Configuration}}
-
-    - name: List files
-      run: ls -R
-
-    - name: Upload artifacts to GitHub
-      uses: actions/upload-artifact@v4
-      with:
-        name: "${{env.Title}}_r${{env.CommitCount}}@${{env.CommitHashShort}}"
-        path: "${{github.workspace}}/${{env.Artifacts}}/"
-
-    - name: Compress artifacts
-      if: github.event_name == 'push'
-      run: |
-        mkdir Release
-        7z a "Release/${{env.Title}}.zip" "${{github.workspace}}/${{env.Artifacts}}/*" -mx=9
-        cp "Release/${{env.Title}}.zip" "Release/${{env.Title}}_r${{env.CommitCount}}@${{env.CommitHashShort}}.zip"
-
-    - name: Purge tag - latest-${{env.Branch}}
-      if: github.event_name == 'push'
-      run: |
-        gh release delete latest-${{env.Branch}} --repo ${{github.repository}} --cleanup-tag --yes || true
-
-    - name: Release - archive-${{env.Branch}}
-      if: github.event_name == 'push'
-      run: |
-        gh release create archive-${{env.Branch}} --repo ${{github.repository}} --target ${{env.FirstCommitHash}} --latest=false --prerelease --title "${{env.Title}} ${{env.Branch}} build archive" --notes "Latest build: https://github.com/${{github.repository}}/releases/latest-${{env.Branch}}
-        Build logs: https://github.com/${{github.repository}}/actions" || true
-        gh release edit archive-${{env.Branch}} --repo ${{github.repository}} --target ${{env.FirstCommitHash}} --latest=false --prerelease --title "${{env.Title}} ${{env.Branch}} build archive" --notes "Latest build: https://github.com/${{github.repository}}/releases/latest-${{env.Branch}}
-        Build logs: https://github.com/${{github.repository}}/actions" || true
-        gh release upload archive-${{env.Branch}} --repo ${{github.repository}} --clobber "Release/${{env.Title}}_r${{env.CommitCount}}@${{env.CommitHashShort}}.zip"
-
-    - name: Release - latest-${{env.Branch}}
-      if: github.event_name == 'push'
-      run: |
-        gh release create latest-${{env.Branch}} --repo ${{github.repository}} --target ${{env.CommitHash}} --generate-notes --latest=true --title "${{env.Title}} r${{env.CommitCount}}@${{env.CommitHashShort}}" --notes "Build archive: https://github.com/${{github.repository}}/releases/tag/archive-${{env.Branch}}
-        Build log: https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}"
-        gh release upload latest-${{env.Branch}} --repo ${{github.repository}} --clobber "Release/${{env.Title}}.zip"
+        Invoke-WebRequest -Method Get -Uri "https://github.com/ThreeDeeJay/VKQB3DV/releases/download/Dependencies/VulkanSDK-1.1.114-Installer.exe" -OutFile VulkanSDK.exe -UseBasicParsing
+        Start-Process -Wait ./VulkanSDK.exe -ArgumentList "/S"
