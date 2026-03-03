@@ -50,18 +50,19 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi.h"								-o "include/nvapi/nvapi.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_interface.h"			-o "include/nvapi/nvapi_interface.h"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi.h"					-o "include/nvapi/nvapi.h"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_interface.h"		-o "include/nvapi/nvapi_interface.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_common.h"		-o "include/nvapi/nvapi_lite_common.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_d3dext.h"		-o "include/nvapi/nvapi_lite_d3dext.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_salend.h"		-o "include/nvapi/nvapi_lite_salend.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_salstart.h"	-o "include/nvapi/nvapi_lite_salstart.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_sli.h"				-o "include/nvapi/nvapi_lite_sli.h"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_sli.h"			-o "include/nvapi/nvapi_lite_sli.h"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi_lite_surround.h"	-o "include/nvapi/nvapi_lite_surround.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/NvApiDriverSettings.h"	-o "include/nvapi/NvApiDriverSettings.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvHLSLExtns.h"					-o "include/nvapi/nvHLSLExtns.h"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvHLSLExtns.h"			-o "include/nvapi/nvHLSLExtns.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvHLSLExtnsInternal.h"	-o "include/nvapi/nvHLSLExtnsInternal.h"
         curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvShaderExtnEnums.h"		-o "include/nvapi/nvShaderExtnEnums.h"
-        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/amd64/nvapi64.lib"			-o "include/nvapi/nvapi64.lib"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/amd64/nvapi64.lib"		-o "include/nvapi/nvapi64.lib"
 
     - name: Configure
       run: cmake -A "${{env.Platform}}" -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.Configuration}} #-DCMAKE_PREFIX_PATH=vcpkg\installed\x64-windows
