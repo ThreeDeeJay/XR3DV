@@ -2,16 +2,9 @@
 //  Copyright (C) 2026 XR3DV Contributors
 //  SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "pch.h"
 #include "config.h"
 #include "logging.h"
-
-#include <windows.h>
-#include <shlwapi.h>
-#include <fstream>
-#include <sstream>
-#include <unordered_map>
-#include <algorithm>
-#include <cctype>
 
 #pragma comment(lib, "shlwapi.lib")
 

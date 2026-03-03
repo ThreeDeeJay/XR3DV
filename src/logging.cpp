@@ -2,11 +2,8 @@
 //  Copyright (C) 2026 XR3DV Contributors
 //  SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "pch.h"
 #include "logging.h"
-#include <windows.h>
-#include <mutex>
-#include <ctime>
-#include <fstream>
 
 namespace xr3dv {
 

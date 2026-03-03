@@ -5,16 +5,9 @@
 //  NVAPI stereo bridge: creates a hidden D3D9Ex device, enables NVAPI
 //  stereo mode, and blits D3D11 left/right eye textures into it each frame.
 
+#include "pch.h"
 #include "nvapi_stereo.h"
 #include "logging.h"
-
-#include <d3d9.h>
-#include <d3d11.h>
-#include <d3dcompiler.h>
-#include <wrl/client.h>
-#include <stdexcept>
-#include <cstring>
-#include <vector>
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -127,7 +120,7 @@ bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height) {
 
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::EnableNvStereo() {
-    nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
+    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
     if (nvs != NVAPI_OK) {
         LOG_ERROR("NvAPI_Stereo_CreateHandleFromIUnknown failed (%d)", nvs);
         return false;

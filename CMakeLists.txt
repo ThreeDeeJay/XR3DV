@@ -63,6 +63,7 @@ set(DXSDK_DIR "$ENV{DXSDK_DIR}" CACHE PATH "DirectX SDK root")
 # Runtime DLL sources
 # ---------------------------------------------------------------------------
 set(XR3DV_SOURCES
+    src/pch.cpp
     src/main.cpp
     src/config.cpp
     src/runtime.cpp
@@ -79,6 +80,9 @@ set(XR3DV_SOURCES
 
 add_library(xr3dv SHARED ${XR3DV_SOURCES})
 
+# Precompiled header — ensures d3d11.h is always seen before openxr_platform.h
+target_precompile_headers(xr3dv PRIVATE src/pch.h)
+
 target_include_directories(xr3dv PRIVATE
     "${CMAKE_SOURCE_DIR}/include"
     "${NVAPI_INCLUDE_DIR}"
@@ -91,7 +95,6 @@ target_compile_definitions(xr3dv PRIVATE
     NOMINMAX
     UNICODE
     _UNICODE
-    XR_USE_GRAPHICS_API_D3D11          # enable D3D11 OpenXR platform structs
     XR3DV_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     XR3DV_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     XR3DV_VERSION_PATCH=${PROJECT_VERSION_PATCH}

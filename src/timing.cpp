@@ -2,8 +2,8 @@
 //  Copyright (C) 2026 XR3DV Contributors
 //  SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "pch.h"
 #include "timing.h"
-#include <algorithm>
 
 namespace xr3dv {
 

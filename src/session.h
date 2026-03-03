@@ -3,16 +3,11 @@
 //  SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
-
-// D3D11 headers MUST come before openxr_platform.h, which gates the
-// XrGraphicsBindingD3D11KHR family on XR_USE_GRAPHICS_API_D3D11.
-#ifndef XR_USE_GRAPHICS_API_D3D11
-#  define XR_USE_GRAPHICS_API_D3D11
-#endif
-#include <windows.h>
-#include <d3d11.h>
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
+// All D3D11 / OpenXR platform headers are pulled in via pch.h which every
+// .cpp includes first.  Headers only need their own forward-declarations or
+// lightweight includes.
+#include <openxr/openxr.h>   // core XR types (no platform structs needed here)
+#include <d3d11.h>           // ID3D11Device etc. for function signatures
 #include <wrl/client.h>
 #include <memory>
 #include <mutex>

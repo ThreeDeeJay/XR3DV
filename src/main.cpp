@@ -5,23 +5,11 @@
 //  This file implements the OpenXR Loader ↔ Runtime protocol and all
 //  XrInstance-level API calls.  XrSession-level calls delegate to session.cpp.
 
-// D3D11 headers MUST precede openxr_platform.h so the platform-specific
-// OpenXR structs (XrGraphicsBindingD3D11KHR etc.) are compiled in.
-#ifndef XR_USE_GRAPHICS_API_D3D11
-#  define XR_USE_GRAPHICS_API_D3D11
-#endif
-#include <windows.h>
-#include <d3d11.h>
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
-#include <openxr/openxr_loader_negotiation.h>
-
+#include "pch.h"
 #include "runtime.h"
 #include "session.h"
 #include "logging.h"
 #include "timing.h"
-
-#include <cstring>
 #include <algorithm>
 #include <string>
 #include <vector>

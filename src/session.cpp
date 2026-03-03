@@ -2,10 +2,9 @@
 //  Copyright (C) 2026 XR3DV Contributors
 //  SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "session.h"   // brings in d3d11.h + XR_USE_GRAPHICS_API_D3D11 + openxr_platform.h
+#include "pch.h"
+#include "session.h"
 #include "logging.h"
-#include <algorithm>
-#include <chrono>
 
 namespace xr3dv {
 

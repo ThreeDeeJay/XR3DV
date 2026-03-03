@@ -11,13 +11,9 @@
 //         and our Swapchain::Init adds D3D11_RESOURCE_MISC_SHARED, we can
 //         open the shared handle in D3D9 and StretchRect GPU-to-GPU.
 
+#include "pch.h"
 #include "d3d9_presenter.h"
 #include "logging.h"
-
-#include <d3d9.h>
-#include <d3d11.h>
-#include <dxgi.h>
-#include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
 
