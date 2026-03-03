@@ -50,7 +50,8 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        curl -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi.h" -o "include/nvapi/nvapi.h" --create-dirs
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/nvapi.h"           -o "include/nvapi/nvapi.h"
+        curl --create-dirs -L "https://raw.githubusercontent.com/NVIDIA/nvapi/refs/heads/main/amd64/nvapi64.lib" -o "include/nvapi/nvapi64.lib"
 
     - name: Configure
       run: cmake -A "${{env.Platform}}" -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.Configuration}} #-DCMAKE_PREFIX_PATH=vcpkg\installed\x64-windows
