@@ -127,19 +127,51 @@ file(GENERATE OUTPUT "${RUNTIME_JSON_OUT}"
     CONTENT [=[{
     "file_format_version": "1.0.0",
     "runtime": {
-        "name":            "XR3DV",
-        "library_path":    "./xr3dv.dll",
-        "api_version":     "1.0",
+        "name":                   "XR3DV",
+        "library_path":           "./xr3dv.dll",
+        "api_version":            "1.0.0",
         "implementation_version": "1",
-        "description":     "OpenXR runtime for NVIDIA 3D Vision via NVAPI/D3D9"
+        "description":            "OpenXR runtime for NVIDIA 3D Vision via NVAPI/D3D9"
     }
 }
 ]=])
 
 # ---------------------------------------------------------------------------
-# Install
+# Diagnostic tool — xr3dv_diag.exe
 # ---------------------------------------------------------------------------
-install(TARGETS xr3dv RUNTIME DESTINATION .)
+add_executable(xr3dv_diag src/xr3dv_diag.cpp)
+
+target_precompile_headers(xr3dv_diag REUSE_FROM xr3dv)
+
+target_include_directories(xr3dv_diag PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${NVAPI_INCLUDE_DIR}"
+    "${openxr-sdk_SOURCE_DIR}/include"
+)
+
+target_compile_definitions(xr3dv_diag PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    UNICODE
+    _UNICODE
+    XR3DV_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    XR3DV_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    XR3DV_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
+
+target_compile_options(xr3dv_diag PRIVATE
+    /W4 /WX- /permissive- /Zc:__cplusplus
+)
+
+target_link_libraries(xr3dv_diag PRIVATE
+    d3d11
+    dxgi
+    shlwapi
+)
+
+# Diagnostic tool does NOT link xr3dv.dll — it loads everything dynamically.
+
+install(TARGETS xr3dv xr3dv_diag RUNTIME DESTINATION .)
 install(FILES   "${RUNTIME_JSON_OUT}" DESTINATION .)
 install(FILES   "${CMAKE_SOURCE_DIR}/config/xr3dv.ini.example" DESTINATION .)
 install(FILES   "${CMAKE_SOURCE_DIR}/scripts/install.ps1"       DESTINATION .)

@@ -12,3 +12,4 @@ include/nvapi/
 # Log files
 *.log
 xr3dv.ini
+/Release
