@@ -36,9 +36,10 @@ public:
     XrResult Wait(const XrSwapchainImageWaitInfo& info);
     XrResult Release();
 
-    uint32_t Width()  const { return m_width; }
-    uint32_t Height() const { return m_height; }
-    uint32_t Format() const { return m_format; }
+    uint32_t Width()   const { return m_width; }
+    uint32_t Height()  const { return m_height; }
+    uint32_t Format()  const { return m_format; }
+    bool     IsDepth() const { return m_isDepth; }
 
     /// Get the most-recently-released image (the one to display).
     const Image* GetLatestImage() const;
@@ -50,11 +51,12 @@ private:
     std::queue<uint32_t> m_freeQueue;
     mutable std::mutex   m_mtx;
 
-    int32_t  m_acquired  = -1;  // index of currently-acquired image, or -1
-    uint32_t m_latest    = 0;   // index of last released image (for display)
+    int32_t  m_acquired  = -1;
+    uint32_t m_latest    = 0;
     uint32_t m_width     = 0;
     uint32_t m_height    = 0;
     uint32_t m_format    = 0;   // DXGI_FORMAT
+    bool     m_isDepth   = false;
 };
 
 } // namespace xr3dv

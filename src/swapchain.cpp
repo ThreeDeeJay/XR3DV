@@ -8,51 +8,79 @@
 
 namespace xr3dv {
 
+// Returns true for any DXGI format that requires D3D11_BIND_DEPTH_STENCIL.
+static bool IsDepthFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool Swapchain::Init(ID3D11Device* dev, const XrSwapchainCreateInfo& ci) {
-    m_width  = ci.width;
-    m_height = ci.height;
-    m_format = static_cast<uint32_t>(ci.format); // DXGI_FORMAT cast
+    m_width   = ci.width;
+    m_height  = ci.height;
+    m_format  = static_cast<uint32_t>(ci.format);
+    m_isDepth = IsDepthFormat(static_cast<DXGI_FORMAT>(ci.format));
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width          = ci.width;
     desc.Height         = ci.height;
-    desc.MipLevels      = (ci.mipCount > 0) ? ci.mipCount : 1;
+    desc.MipLevels      = (ci.mipCount  > 0) ? ci.mipCount  : 1;
     desc.ArraySize      = (ci.arraySize > 0) ? ci.arraySize : 1;
     desc.Format         = static_cast<DXGI_FORMAT>(ci.format);
     desc.SampleDesc     = {ci.sampleCount > 0 ? ci.sampleCount : 1, 0};
     desc.Usage          = D3D11_USAGE_DEFAULT;
-    desc.BindFlags      = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     desc.CPUAccessFlags = 0;
     desc.MiscFlags      = 0;
+
+    if (m_isDepth) {
+        // Depth formats must use BIND_DEPTH_STENCIL; BIND_RENDER_TARGET or
+        // BIND_SHADER_RESOURCE with a plain depth format is E_INVALIDARG.
+        desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    } else {
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    }
 
     m_images.resize(kImageCount);
     for (uint32_t i = 0; i < kImageCount; ++i) {
         HRESULT hr = dev->CreateTexture2D(&desc, nullptr, &m_images[i].tex);
         if (FAILED(hr)) {
-            LOG_ERROR("Swapchain: CreateTexture2D [%u] failed: 0x%08X", i, hr);
+            LOG_ERROR("Swapchain: CreateTexture2D [%u] fmt=%u depth=%d failed: 0x%08X",
+                      i, m_format, (int)m_isDepth, (unsigned)hr);
             return false;
         }
 
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Format                    = desc.Format;
-        srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MostDetailedMip = 0;
-        srvDesc.Texture2D.MipLevels       = desc.MipLevels;
+        // SRV is only valid for colour textures; depth textures need a
+        // typeless base format (which we don't use), so leave srv null.
+        if (!m_isDepth) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format                    = desc.Format;
+            srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            srvDesc.Texture2D.MipLevels       = desc.MipLevels;
 
-        hr = dev->CreateShaderResourceView(m_images[i].tex.Get(), &srvDesc,
-                                            &m_images[i].srv);
-        if (FAILED(hr)) {
-            LOG_ERROR("Swapchain: CreateSRV [%u] failed: 0x%08X", i, hr);
-            return false;
+            hr = dev->CreateShaderResourceView(m_images[i].tex.Get(), &srvDesc,
+                                                &m_images[i].srv);
+            if (FAILED(hr)) {
+                LOG_ERROR("Swapchain: CreateSRV [%u] failed: 0x%08X", i, (unsigned)hr);
+                return false;
+            }
         }
 
         m_freeQueue.push(i);
     }
 
-    LOG_VERBOSE("Swapchain created: %ux%u fmt=%u count=%u",
-                m_width, m_height, m_format, kImageCount);
+    LOG_VERBOSE("Swapchain created: %ux%u fmt=%u %s count=%u",
+                m_width, m_height, m_format,
+                m_isDepth ? "DEPTH" : "COLOR", kImageCount);
     return true;
 }
+
 
 XrResult Swapchain::Acquire(uint32_t& outIndex) {
     std::lock_guard<std::mutex> lk(m_mtx);

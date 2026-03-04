@@ -172,6 +172,11 @@ bool Session::PresentFrame(const XrFrameEndInfo* /*info*/) {
         return false;
     }
 
+    if (left->IsDepth() || right->IsDepth()) {
+        LOG_ERROR("EndFrame: projection view swapchain is a depth format — skipping blit");
+        return false;
+    }
+
     const auto* leftImg  = left->GetLatestImage();
     const auto* rightImg = right->GetLatestImage();
 
