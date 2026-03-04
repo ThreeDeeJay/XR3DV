@@ -317,9 +317,63 @@ xrGetD3D11GraphicsRequirementsKHR(XrInstance /*instance*/,
                                    XrSystemId /*systemId*/,
                                    XrGraphicsRequirementsD3D11KHR* req)
 {
-    req->type               = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
-    req->adapterLuid        = {}; // zero = any adapter
-    req->minFeatureLevel    = D3D_FEATURE_LEVEL_11_0;
+    req->type            = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
+    req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+    req->adapterLuid     = {};  // overwritten below
+
+    // Canonical approach: create a throwaway D3D11 device on the default
+    // hardware adapter, then walk D3D11Device → IDXGIDevice → IDXGIAdapter
+    // to read back the exact LUID that was selected.
+    // This avoids having to enumerate adapters ourselves and correctly handles
+    // systems with multiple GPUs (Windows picks the same adapter it will
+    // give back when the app calls D3D11CreateDevice with our LUID).
+    {
+        D3D_FEATURE_LEVEL fl;
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        HRESULT hr = D3D11CreateDevice(
+            nullptr,                  // pAdapter  = let Windows choose
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,                  // hSoftware
+            0,                        // Flags
+            nullptr, 0,               // no specific feature levels
+            D3D11_SDK_VERSION,
+            &dev, &fl, nullptr);
+
+        if (SUCCEEDED(hr)) {
+            Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
+            hr = dev.As(&dxgiDev);
+            if (SUCCEEDED(hr)) {
+                Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+                hr = dxgiDev->GetAdapter(&adapter);
+                if (SUCCEEDED(hr)) {
+                    DXGI_ADAPTER_DESC desc{};
+                    hr = adapter->GetDesc(&desc);
+                    if (SUCCEEDED(hr)) {
+                        req->adapterLuid = desc.AdapterLuid;
+                        LOG_INFO("xrGetD3D11GraphicsRequirementsKHR: "
+                                 "adapter='%ls' LUID={%08X,%08X} fl=0x%04X",
+                                 desc.Description,
+                                 (unsigned)desc.AdapterLuid.HighPart,
+                                 (unsigned)desc.AdapterLuid.LowPart,
+                                 (unsigned)fl);
+                    } else {
+                        LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: GetDesc failed 0x%08X", hr);
+                    }
+                } else {
+                    LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: GetAdapter failed 0x%08X", hr);
+                }
+            } else {
+                LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: QueryInterface IDXGIDevice failed 0x%08X", hr);
+            }
+        } else {
+            LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: D3D11CreateDevice failed 0x%08X", hr);
+        }
+    }
+
+    if (req->adapterLuid.HighPart == 0 && req->adapterLuid.LowPart == 0) {
+        LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: LUID is still {0,0} -- app will fail to find adapter");
+    }
+
     return XR_SUCCESS;
 }
 

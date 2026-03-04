@@ -696,7 +696,17 @@ static void CheckSessionCreation() {
             }
             XrResult r = pfn(g_instance, sid, &req);
             if (r == XR_SUCCESS) {
-                PASS("xrGetD3D11GraphicsReqs", "MinFeatureLevel=0x%04X", (unsigned)req.minFeatureLevel);
+                PASS("xrGetD3D11GraphicsReqs",
+                     "MinFeatureLevel=0x%04X  AdapterLUID={%08X,%08X}",
+                     (unsigned)req.minFeatureLevel,
+                     (unsigned)req.adapterLuid.HighPart,
+                     (unsigned)req.adapterLuid.LowPart);
+                // Warn if LUID is still all-zeros (adapter enumeration failed in runtime)
+                if (req.adapterLuid.HighPart == 0 && req.adapterLuid.LowPart == 0) {
+                    WARN("AdapterLUID non-zero", "LUID is {0,0} -- apps that match by LUID will fail");
+                } else {
+                    PASS("AdapterLUID non-zero", "OK");
+                }
                 if (fl >= req.minFeatureLevel) {
                     PASS("Feature level sufficient", "0x%04X >= 0x%04X",
                          (unsigned)fl, (unsigned)req.minFeatureLevel);
