@@ -279,6 +279,8 @@ xrEnumerateEnvironmentBlendModes(
 }
 
 
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrEnumerateViewConfigurationViews(XrInstance /*instance*/, XrSystemId /*systemId*/,
                                    XrViewConfigurationType type,
                                    uint32_t cap, uint32_t* count,
                                    XrViewConfigurationView* views)
