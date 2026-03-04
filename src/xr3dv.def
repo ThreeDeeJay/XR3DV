@@ -3,6 +3,9 @@ EXPORTS
     ; OpenXR loader negotiation
     xrNegotiateLoaderRuntimeInterface
 
+    ; Function pointer dispatch — must be a direct export per loader spec
+    xrGetInstanceProcAddr
+
     ; Core instance
     xrEnumerateApiLayerProperties
     xrEnumerateInstanceExtensionProperties
@@ -25,6 +28,7 @@ EXPORTS
     xrEnumerateViewConfigurations
     xrGetViewConfigurationProperties
     xrEnumerateViewConfigurationViews
+    xrEnumerateEnvironmentBlendModes
     xrEnumerateSwapchainFormats
     xrCreateSwapchain
     xrDestroySwapchain

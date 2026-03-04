@@ -545,11 +545,11 @@ static void CheckOpenXRLoader() {
         if (pfn) {
             XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
             if (pfn(g_instance, &props) == XR_SUCCESS) {
-                PASS("xrGetInstanceProperties", "Runtime: '%s' v%llu.%llu.%llu",
+                PASS("xrGetInstanceProperties", "Runtime: '%s' v%u.%u.%u",
                      props.runtimeName,
-                     XR_VERSION_MAJOR(props.runtimeVersion),
-                     XR_VERSION_MINOR(props.runtimeVersion),
-                     XR_VERSION_PATCH(props.runtimeVersion));
+                     (unsigned)XR_VERSION_MAJOR(props.runtimeVersion),
+                     (unsigned)XR_VERSION_MINOR(props.runtimeVersion),
+                     (unsigned)XR_VERSION_PATCH(props.runtimeVersion));
             } else {
                 WARN("xrGetInstanceProperties", "Call failed");
             }
@@ -619,7 +619,36 @@ static void CheckOpenXRLoader() {
             }
         }
     }
-}
+    // ---- xrEnumerateEnvironmentBlendModes -------------------------------
+    if (systemId != XR_NULL_SYSTEM_ID) {
+        PFN_xrEnumerateEnvironmentBlendModes pfn = nullptr;
+        GetXrProc("xrEnumerateEnvironmentBlendModes", pfn);
+        if (!pfn) {
+            FAIL("xrEnumEnvBlendModes", "Proc not found -- hello_xr will abort here");
+        } else {
+            uint32_t cnt = 0;
+            XrResult r = pfn(g_instance, systemId,
+                              XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &cnt, nullptr);
+            if (r == XR_SUCCESS && cnt > 0) {
+                std::vector<XrEnvironmentBlendMode> modes(cnt);
+                pfn(g_instance, systemId,
+                    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, cnt, &cnt, modes.data());
+                PASS("xrEnumEnvBlendModes", "%u mode(s)", cnt);
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    const char* name =
+                        (modes[i] == XR_ENVIRONMENT_BLEND_MODE_OPAQUE)      ? "OPAQUE" :
+                        (modes[i] == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE)    ? "ADDITIVE" :
+                        (modes[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) ? "ALPHA_BLEND" :
+                                                                               "UNKNOWN";
+                    INFO("  Blend mode", "%s (%d)", name, (int)modes[i]);
+                }
+            } else {
+                FAIL("xrEnumEnvBlendModes", "Returned r=%d cnt=%u", (int)r, cnt);
+            }
+        }
+    }
+
+} // end CheckOpenXRLoader
 
 // ============================================================================
 // Section 6 — D3D11 device + session creation

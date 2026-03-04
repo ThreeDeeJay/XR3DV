@@ -256,7 +256,29 @@ xrGetViewConfigurationProperties(XrInstance /*instance*/, XrSystemId /*systemId*
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
-xrEnumerateViewConfigurationViews(XrInstance /*instance*/, XrSystemId /*systemId*/,
+xrEnumerateEnvironmentBlendModes(
+    XrInstance              /*instance*/,
+    XrSystemId              /*systemId*/,
+    XrViewConfigurationType viewConfigurationType,
+    uint32_t                environmentBlendModeCapacityInput,
+    uint32_t*               environmentBlendModeCountOutput,
+    XrEnvironmentBlendMode* environmentBlendModes)
+{
+    // XR3DV presents to a physical display — opaque is the only blend mode.
+    if (viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+
+    *environmentBlendModeCountOutput = 1;
+    if (environmentBlendModeCapacityInput == 0)
+        return XR_SUCCESS;
+    if (environmentBlendModeCapacityInput < 1)
+        return XR_ERROR_SIZE_INSUFFICIENT;
+
+    environmentBlendModes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    return XR_SUCCESS;
+}
+
+
                                    XrViewConfigurationType type,
                                    uint32_t cap, uint32_t* count,
                                    XrViewConfigurationView* views)
@@ -533,6 +555,7 @@ xrGetInstanceProcAddr(XrInstance /*instance*/, const char* name,
     DISPATCH(xrEnumerateViewConfigurations)
     DISPATCH(xrGetViewConfigurationProperties)
     DISPATCH(xrEnumerateViewConfigurationViews)
+    DISPATCH(xrEnumerateEnvironmentBlendModes)
     DISPATCH(xrEnumerateSwapchainFormats)
     DISPATCH(xrCreateSwapchain)
     DISPATCH(xrDestroySwapchain)
