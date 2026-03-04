@@ -1,40 +1,42 @@
 # XR3DV Uninstall Script
 # Removes XR3DV from the OpenXR runtime registry and restores the previous runtime.
-# Run as Administrator.
+# Run as Administrator to also clear the HKLM entry.
 
 $ErrorActionPreference = 'Stop'
-Set-StrictMode -Version 2
+# NOTE: StrictMode intentionally omitted - accessing absent registry properties
+# throws under StrictMode even with -ErrorAction SilentlyContinue.
 
-$regKey = 'HKLM:\SOFTWARE\Khronos\OpenXR\1'
-
-$current = (Get-ItemProperty -Path $regKey -Name 'ActiveRuntime' -ErrorAction SilentlyContinue).ActiveRuntime
-if ($current -notlike '*xr3dv*') {
-    Write-Host ('XR3DV is not currently the active runtime (' + $current + ').')
-    exit 0
+function Get-RegValue {
+    param([string]$Path, [string]$Name)
+    try {
+        $obj = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        return $obj.$Name
+    } catch {
+        return $null
+    }
 }
 
-$backup = (Get-ItemProperty -Path $regKey -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue).ActiveRuntime_XR3DV_Backup
-if ($backup) {
-    Write-Host ('Restoring previous runtime: ' + $backup)
-    Set-ItemProperty -Path $regKey -Name 'ActiveRuntime' -Value $backup
-    Remove-ItemProperty -Path $regKey -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue
-} else {
-    Write-Host 'No backup found - removing ActiveRuntime key entirely.'
-    Remove-ItemProperty -Path $regKey -Name 'ActiveRuntime' -ErrorAction SilentlyContinue
-}
+foreach ($hive in @('HKLM', 'HKCU')) {
+    $key = $hive + ':\SOFTWARE\Khronos\OpenXR\1'
+    if (-not (Test-Path $key)) {
+        Write-Host ('[' + $hive + '] Key does not exist - skipped.')
+        continue
+    }
 
-# Also clear HKCU if set
-$hkcuKey = 'HKCU:\SOFTWARE\Khronos\OpenXR\1'
-$hkcuVal = (Get-ItemProperty -Path $hkcuKey -Name 'ActiveRuntime' -ErrorAction SilentlyContinue).ActiveRuntime
-if ($hkcuVal -like '*xr3dv*') {
-    $hkcuBk = (Get-ItemProperty -Path $hkcuKey -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue).ActiveRuntime_XR3DV_Backup
-    if ($hkcuBk) {
-        Set-ItemProperty -Path $hkcuKey -Name 'ActiveRuntime' -Value $hkcuBk
-        Remove-ItemProperty -Path $hkcuKey -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue
-        Write-Host ('[HKCU] Restored: ' + $hkcuBk)
+    $cur = Get-RegValue -Path $key -Name 'ActiveRuntime'
+    if ($null -eq $cur -or $cur -notlike '*xr3dv*') {
+        Write-Host ('[' + $hive + '] XR3DV is not the active runtime - skipped.')
+        continue
+    }
+
+    $bk = Get-RegValue -Path $key -Name 'ActiveRuntime_XR3DV_Backup'
+    if ($null -ne $bk) {
+        Set-ItemProperty -Path $key -Name 'ActiveRuntime' -Value $bk
+        Remove-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue
+        Write-Host ('[' + $hive + '] Restored previous runtime: ' + $bk)
     } else {
-        Remove-ItemProperty -Path $hkcuKey -Name 'ActiveRuntime' -ErrorAction SilentlyContinue
-        Write-Host '[HKCU] Removed.'
+        Remove-ItemProperty -Path $key -Name 'ActiveRuntime' -ErrorAction SilentlyContinue
+        Write-Host ('[' + $hive + '] Removed ActiveRuntime (no backup found).')
     }
 }
 

@@ -16,7 +16,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Set-StrictMode -Version 2
+# NOTE: StrictMode intentionally omitted - it causes false positives when
+# reading registry properties that may not exist yet.
+
+# ---------------------------------------------------------------------------
+# Safe registry read: returns $null instead of throwing when key/value absent
+# ---------------------------------------------------------------------------
+function Get-RegValue {
+    param([string]$Path, [string]$Name)
+    try {
+        $obj = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        return $obj.$Name
+    } catch {
+        return $null
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Resolve paths
@@ -63,20 +77,29 @@ function Update-JsonLibraryPath {
 function Register-Runtime {
     param([string]$Hive, [string]$JsonAbsPath)
     $key = $Hive + ':\SOFTWARE\Khronos\OpenXR\1'
+
+    # Ensure the key exists
     if (-not (Test-Path $key)) {
         New-Item -Path $key -Force | Out-Null
+        Write-Host ('  [' + $Hive + '] Created registry key.')
     }
-    $cur = (Get-ItemProperty -Path $key -Name 'ActiveRuntime' -ErrorAction SilentlyContinue).ActiveRuntime
-    if ($cur -and ($cur -notlike '*xr3dv*')) {
-        Write-Host ('  [' + $Hive + '] Backing up: ' + $cur)
+
+    # Back up whatever is currently active (only if it is not already XR3DV)
+    $cur = Get-RegValue -Path $key -Name 'ActiveRuntime'
+    if (($null -ne $cur) -and ($cur -notlike '*xr3dv*')) {
+        Write-Host ('  [' + $Hive + '] Backing up existing runtime: ' + $cur)
         Set-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -Value $cur
     }
+
+    # Write the new value
     Set-ItemProperty -Path $key -Name 'ActiveRuntime' -Type String -Value $JsonAbsPath
-    $rb = (Get-ItemProperty -Path $key -Name 'ActiveRuntime').ActiveRuntime
+
+    # Read back to confirm
+    $rb = Get-RegValue -Path $key -Name 'ActiveRuntime'
     if ($rb -eq $JsonAbsPath) {
         Write-Host ('  [' + $Hive + '] OK: ' + $JsonAbsPath)
     } else {
-        Write-Warning ('  [' + $Hive + '] Readback mismatch: ' + $rb)
+        Write-Warning ('  [' + $Hive + '] Readback mismatch. Got: ' + $rb)
     }
 }
 
@@ -86,10 +109,10 @@ function Register-Runtime {
 if ($Uninstall) {
     foreach ($hive in @('HKLM', 'HKCU')) {
         $key = $hive + ':\SOFTWARE\Khronos\OpenXR\1'
-        $cur = (Get-ItemProperty -Path $key -Name 'ActiveRuntime' -ErrorAction SilentlyContinue).ActiveRuntime
-        if ($cur -like '*xr3dv*') {
-            $bk = (Get-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue).ActiveRuntime_XR3DV_Backup
-            if ($bk) {
+        $cur = Get-RegValue -Path $key -Name 'ActiveRuntime'
+        if ($null -ne $cur -and $cur -like '*xr3dv*') {
+            $bk = Get-RegValue -Path $key -Name 'ActiveRuntime_XR3DV_Backup'
+            if ($null -ne $bk) {
                 Set-ItemProperty -Path $key -Name 'ActiveRuntime' -Value $bk
                 Remove-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue
                 Write-Host ('[' + $hive + '] Restored: ' + $bk)
