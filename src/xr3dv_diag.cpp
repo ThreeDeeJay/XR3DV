@@ -424,14 +424,39 @@ static void CheckOpenXRLoader() {
     printf("\n");
     SetColor(C::White); printf("=== 5. OpenXR Loader (system path) ===\n"); ResetColor();
 
-    // Try to load the OpenXR loader DLL
+    // Try to load the OpenXR loader DLL — check several locations
     HMODULE hLoader = LoadLibraryA("openxr_loader.dll");
+    if (!hLoader) hLoader = LoadLibraryA("openxr_loader-1_0.dll");
+
+    // Check Khronos SDK install path from registry
     if (!hLoader) {
-        // Some SDKs put it under a versioned name
-        hLoader = LoadLibraryA("openxr_loader-1_0.dll");
+        std::string sdkPath = RegReadString(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Khronos\\OpenXR\\1", "");   // default value sometimes has SDK path
+        if (sdkPath.empty()) {
+            // Some SDK installers write the bin dir under a separate key
+            sdkPath = RegReadString(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Khronos\\OpenXR\\1", "SDKBin");
+        }
+        if (!sdkPath.empty()) {
+            std::string loaderPath = sdkPath + "\\openxr_loader.dll";
+            hLoader = LoadLibraryA(loaderPath.c_str());
+            if (hLoader) INFO("openxr_loader.dll", "Found via Khronos SDK registry");
+        }
+    }
+
+    // Last resort: look next to our own exe (some apps ship the loader)
+    if (!hLoader) {
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        PathRemoveFileSpecA(exePath);
+        std::string localLoader = std::string(exePath) + "\\openxr_loader.dll";
+        hLoader = LoadLibraryA(localLoader.c_str());
+        if (hLoader) INFO("openxr_loader.dll", "Found next to xr3dv_diag.exe");
     }
     if (!hLoader) {
-        WARN("openxr_loader.dll", "Not found in PATH — testing via direct DLL instead");
+        WARN("openxr_loader.dll", "Not found in PATH, registry, or next to exe. "
+             "Install the Khronos OpenXR SDK or add the loader to PATH. "
+             "Testing via xr3dv.dll directly instead.");
         g_loaderGIPA = g_negotiatedGetProcAddr;
         if (!g_loaderGIPA) {
             SKIP("Loader path", "No getInstanceProcAddr available");
@@ -581,7 +606,9 @@ static void CheckOpenXRLoader() {
                     XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, cnt, &cnt, vcv.data());
                 PASS("View config (stereo)", "%u views", cnt);
                 for (uint32_t i = 0; i < cnt; ++i) {
-                    INFO("  Eye %u", "%ux%u (max %ux%u)", i,
+                    char eyeLabel[32];
+                    snprintf(eyeLabel, sizeof(eyeLabel), "  Eye [%u]", i);
+                    INFO(eyeLabel, "%ux%u recommended, %ux%u max",
                          vcv[i].recommendedImageRectWidth,
                          vcv[i].recommendedImageRectHeight,
                          vcv[i].maxImageRectWidth,
@@ -776,67 +803,196 @@ static void CheckFrameLoop() {
 // ============================================================================
 // Section 8 — NVAPI / 3D Vision availability
 // ============================================================================
+
+// NVAPI QueryInterface IDs we need (from nvapi.h / public NVAPI docs).
+// These are stable across driver versions.
+static const uint32_t kNvAPI_Initialize_ID          = 0x0150E828u;
+static const uint32_t kNvAPI_Stereo_IsEnabled_ID     = 0x348FF8E1u;
+static const uint32_t kNvAPI_GetErrorMessage_ID      = 0x6C2D048Cu;
+
+typedef void*   (__cdecl* PFN_NvAPI_QueryInterface)(uint32_t id);
+typedef int     (__cdecl* PFN_NvAPI_Initialize)();
+typedef int     (__cdecl* PFN_NvAPI_Stereo_IsEnabled)(uint8_t* pIsStereoEnabled);
+
+/// Try to call NvAPI_Stereo_IsEnabled directly via QueryInterface.
+/// Returns: 1=enabled, 0=disabled, -1=could not determine
+static int TryNvapiStereoIsEnabled(HMODULE hNvapi) {
+    auto pfnQI = (PFN_NvAPI_QueryInterface)GetProcAddress(hNvapi, "nvapi_QueryInterface");
+    if (!pfnQI) return -1;
+
+    auto pfnInit = (PFN_NvAPI_Initialize)pfnQI(kNvAPI_Initialize_ID);
+    if (!pfnInit) return -1;
+    if (pfnInit() != 0 /*NVAPI_OK*/) return -1;  // 0 = NVAPI_OK
+
+    auto pfnStereoIsEnabled = (PFN_NvAPI_Stereo_IsEnabled)pfnQI(kNvAPI_Stereo_IsEnabled_ID);
+    if (!pfnStereoIsEnabled) return -1;
+
+    uint8_t enabled = 0;
+    int r = pfnStereoIsEnabled(&enabled);
+    if (r != 0) return -1;
+    return static_cast<int>(enabled);
+}
+
+/// Try running NvapiHelper.exe and reading result.txt.
+/// Path: <exeDir>/Tools/NvapiHelper/NvapiHelper.exe
+/// Produces: result.txt containing "True" or "False"
+static int TryNvapiHelper(const std::string& exeDir) {
+    std::string helperPath = exeDir + "\\Tools\\NvapiHelper\\NvapiHelper.exe";
+    if (!PathFileExistsA(helperPath.c_str())) return -1;
+
+    std::string resultPath = exeDir + "\\Tools\\NvapiHelper\\result.txt";
+    // Delete stale result
+    DeleteFileA(resultPath.c_str());
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+
+    std::string cmdLine = "\"" + helperPath + "\" isStereo3dEnabled";
+    std::vector<char> cmd(cmdLine.begin(), cmdLine.end());
+    cmd.push_back('\0');
+
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr,
+                        FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, 5000 /*ms*/);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    std::string result = ReadFileText(resultPath);
+    // Trim whitespace
+    while (!result.empty() && (result.back() == '\r' || result.back() == '\n' ||
+                                result.back() == ' '))
+        result.pop_back();
+
+    if (result == "True")  return 1;
+    if (result == "False") return 0;
+    return -1;
+}
+
 static void CheckNvapi() {
     printf("\n");
     SetColor(C::White); printf("=== 8. NVAPI / 3D Vision ===\n"); ResetColor();
 
-    // Load nvapi64.dll from its standard locations
+    // Determine our own exe directory for NvapiHelper search
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    PathRemoveFileSpecA(exePath);
+    std::string exeDir = exePath;
+
+    // ------------------------------------------------------------------
+    // 8a. Load nvapi64.dll
+    // ------------------------------------------------------------------
     HMODULE hNvapi = LoadLibraryA("nvapi64.dll");
     if (!hNvapi) {
-        // Try SysWOW64 / driver dir
         char sysDir[MAX_PATH];
         GetSystemDirectoryA(sysDir, MAX_PATH);
         std::string p = std::string(sysDir) + "\\nvapi64.dll";
         hNvapi = LoadLibraryA(p.c_str());
     }
-
     if (!hNvapi) {
         FAIL("nvapi64.dll", "Not found — is an NVIDIA driver installed?");
         return;
     }
     PASS("nvapi64.dll", "Loaded");
 
-    // NvAPI_Initialize
-    typedef int(__cdecl* PFN_NvAPI_Initialize)();
-    auto pfnInit = (PFN_NvAPI_Initialize)GetProcAddress(hNvapi, "nvapi_QueryInterface");
-    if (!pfnInit) {
-        // nvapi64.dll exports via QueryInterface by ID, not by name
-        INFO("nvapi64.dll exports", "Uses QueryInterface pattern (normal)");
+    // ------------------------------------------------------------------
+    // 8b. Determine 3D Vision stereo-enabled status.
+    //     We try three methods in order of reliability:
+    //       1. NvAPI_Stereo_IsEnabled via QueryInterface (most reliable)
+    //       2. NvapiHelper.exe helper tool (if present in Tools/)
+    //       3. Registry heuristics (WOW6432Node path used by modern drivers)
+    // ------------------------------------------------------------------
+    int stereoEnabled = -1;  // -1 = unknown
+    const char* stereoMethod = nullptr;
+
+    // Method 1 — direct NVAPI call
+    stereoEnabled = TryNvapiStereoIsEnabled(hNvapi);
+    if (stereoEnabled >= 0) {
+        stereoMethod = "NvAPI_Stereo_IsEnabled()";
+        INFO("3DV detection method", "Direct NVAPI call");
     }
 
-    // We can't easily call NVAPI functions without the SDK's query IDs, but
-    // we can at least check that the driver version supports stereo via the
-    // registry keys NVIDIA sets.
-    const char* nvidiaKey = "SOFTWARE\\NVIDIA Corporation\\Global\\Stereo3D";
-    std::string stereoEnable = RegReadString(HKEY_LOCAL_MACHINE, nvidiaKey, "StereoEnable");
+    // Method 2 — NvapiHelper.exe
+    if (stereoEnabled < 0) {
+        stereoEnabled = TryNvapiHelper(exeDir);
+        if (stereoEnabled >= 0) {
+            stereoMethod = "NvapiHelper.exe";
+            INFO("3DV detection method", "NvapiHelper.exe");
+        }
+    }
 
-    if (stereoEnable == "1") {
-        PASS("3D Vision StereoEnable", "HKLM\\...\\Stereo3D\\StereoEnable = 1");
-    } else if (stereoEnable == "0") {
-        WARN("3D Vision StereoEnable", "StereoEnable = 0 — enable in NVIDIA Control Panel "
-             "(Manage 3D Settings → Stereo - Enable)");
+    // Method 3 — Registry (try multiple known paths)
+    if (stereoEnabled < 0) {
+        // Modern 64-bit drivers write to WOW6432Node
+        const char* regPaths[] = {
+            "SOFTWARE\\WOW6432Node\\NVIDIA Corporation\\Global\\Stereo3D",
+            "SOFTWARE\\NVIDIA Corporation\\Global\\Stereo3D",
+        };
+        for (auto* path : regPaths) {
+            std::string val = RegReadString(HKEY_LOCAL_MACHINE, path, "StereoEnable");
+            if (!val.empty()) {
+                stereoEnabled = (val == "1") ? 1 : 0;
+                stereoMethod  = path;
+                INFO("3DV detection method", "Registry: HKLM\\%s", path);
+                break;
+            }
+        }
+    }
+
+    // Report the result
+    if (stereoEnabled > 0) {
+        PASS("3D Vision stereo enabled", "Yes (via %s)", stereoMethod ? stereoMethod : "?");
+    } else if (stereoEnabled == 0) {
+        WARN("3D Vision stereo enabled",
+             "No (via %s) — enable in NVIDIA Control Panel: "
+             "Manage 3D Settings > Stereo - Enable > On",
+             stereoMethod ? stereoMethod : "?");
     } else {
-        WARN("3D Vision StereoEnable", "Key not found (value='%s'). "
-             "Enable 3D Vision in NVIDIA Control Panel.", stereoEnable.c_str());
+        // Could not determine — give actionable advice without a hard FAIL
+        WARN("3D Vision stereo enabled",
+             "Could not determine state. "
+             "Place NvapiHelper.exe at %s\\Tools\\NvapiHelper\\NvapiHelper.exe "
+             "for a definitive check, or verify manually in NVIDIA Control Panel.",
+             exeDir.c_str());
+        INFO("Registry paths checked",
+             "HKLM\\SOFTWARE\\WOW6432Node\\NVIDIA Corporation\\Global\\Stereo3D");
     }
 
-    // Check display mode — 3D Vision requires 120 Hz
+    // ------------------------------------------------------------------
+    // 8c. Display mode — 3D Vision requires >= 100 Hz (120 Hz ideal)
+    // ------------------------------------------------------------------
     DEVMODEA dm{};
     dm.dmSize = sizeof(dm);
     if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
         INFO("Primary display", "%ux%u @ %u Hz",
              dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
         if (dm.dmDisplayFrequency >= 100) {
-            PASS("Display refresh rate", "%u Hz (≥100 Hz, OK for 3D Vision)",
+            PASS("Display refresh rate", "%u Hz (>=100 Hz, OK for 3D Vision)",
                  dm.dmDisplayFrequency);
         } else {
-            WARN("Display refresh rate", "%u Hz — 3D Vision requires ≥100 Hz "
-                 "(ideally 120 Hz). Check monitor settings.", dm.dmDisplayFrequency);
+            WARN("Display refresh rate",
+                 "%u Hz -- 3D Vision requires >=100 Hz (ideally 120 Hz). "
+                 "Change in Display Settings > Advanced display > Refresh rate.",
+                 dm.dmDisplayFrequency);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 8d. Confirm nvapi64.dll exports nvapi_QueryInterface (sanity)
+    // ------------------------------------------------------------------
+    if (GetProcAddress(hNvapi, "nvapi_QueryInterface")) {
+        PASS("nvapi_QueryInterface export", "Present (expected)");
+    } else {
+        WARN("nvapi_QueryInterface export", "Missing -- unusual, driver may be incomplete");
     }
 
     FreeLibrary(hNvapi);
 }
+
 
 // ============================================================================
 // Section 9 — Cleanup + Summary
