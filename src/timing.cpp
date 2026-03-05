@@ -22,7 +22,12 @@ int64_t FrameTimer::NowNs() {
     LARGE_INTEGER freq, qpc;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&qpc);
-    return (qpc.QuadPart * 1'000'000'000LL) / freq.QuadPart;
+    // Overflow-safe QPC -> nanoseconds.
+    // Naive qpc.QuadPart * 1e9 overflows int64 after roughly 9 seconds of
+    // ticks at a 1 GHz counter, or ~2.5 hours at a typical 10 MHz QPC.
+    // Split into whole seconds + sub-second remainder to stay in range.
+    return (qpc.QuadPart / freq.QuadPart) * 1'000'000'000LL
+         + (qpc.QuadPart % freq.QuadPart) * 1'000'000'000LL / freq.QuadPart;
 }
 
 int64_t FrameTimer::WaitAndGetNextDisplayTime() {
@@ -41,9 +46,12 @@ int64_t FrameTimer::WaitAndGetNextDisplayTime() {
         Sleep(sleepMs);
     }
 
-    // Spin the remaining sub-millisecond gap
+    // Spin the remaining sub-millisecond gap.
+    // Hard 10 ms deadline ensures this can never become an infinite loop
+    // if the clock behaves unexpectedly.
+    const int64_t spinDeadline = NowNs() + 10'000'000LL;
     while (NowNs() < m_nextDisplayNs) {
-        _mm_pause(); // avoid CPU thrashing (include <immintrin.h> or use YieldProcessor)
+        if (NowNs() > spinDeadline) break;
         YieldProcessor();
     }
 
