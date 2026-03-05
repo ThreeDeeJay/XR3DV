@@ -115,7 +115,7 @@ xrCreateInstance(const XrInstanceCreateInfo* createInfo, XrInstance* instance)
         bool found = false;
         for (uint32_t j = 0; j < kSupportedExtCount; ++j) {
             if (strcmp(createInfo->enabledExtensionNames[i],
-                        kSupportedExtensions[j]) == 0) {
+                        kSupportedExtensions[j].name) == 0) {
                 found = true; break;
             }
         }

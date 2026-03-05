@@ -20,7 +20,8 @@ static std::string Trim(const std::string& s) {
 }
 
 static std::string ToLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
     return s;
 }
 
