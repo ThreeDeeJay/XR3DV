@@ -58,10 +58,13 @@ private:
     bool CreateStagingResources(uint32_t width, uint32_t height);
 
     /// Read-back D3D11 texture to CPU then upload to D3D9 surface.
+    /// stagingTex and sysMemSurf are cached across frames to avoid per-call allocation.
     bool BlitD3D11ToD3D9(
-        ID3D11ShaderResourceView* srv,
-        ID3D11Device*             d3d11Dev,
-        IDirect3DSurface9*        dst);
+        ID3D11ShaderResourceView*                    srv,
+        ID3D11Device*                                d3d11Dev,
+        IDirect3DSurface9*                           dst,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>&     stagingTex,
+        Microsoft::WRL::ComPtr<IDirect3DSurface9>&   sysMemSurf);
 
     // ------ D3D9 objects -------------------------------------------------
     HWND                                     m_hwnd           = nullptr;
@@ -71,10 +74,15 @@ private:
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer;
 
-    // ------ D3D11 staging texture ----------------------------------------
-    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTex;
+    // ------ D3D11 staging textures (one per eye, cached to avoid per-frame alloc)
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTex;       // left eye
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTexRight;  // right eye
     uint32_t m_stagingWidth  = 0;
     uint32_t m_stagingHeight = 0;
+
+    // Cached SYSMEM surfaces for CPU→D3D9 upload (avoids per-frame allocation)
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemRight;
 
     // ------ NVAPI ---------------------------------------------------------
     StereoHandle m_stereoHandle  = nullptr;   ///< NVAPI stereo handle

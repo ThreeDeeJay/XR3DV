@@ -22,9 +22,10 @@ FetchContent_Declare(
     GIT_TAG        release-1.0.34
     GIT_SHALLOW    TRUE
 )
-# We need the loader DLL for apps that ship without their own copy, and for
-# xr3dv_diag section 5 to test the full system path.
-set(BUILD_LOADER  ON  CACHE BOOL "" FORCE)
+# We only need the OpenXR headers and loader interface, not to build the loader.
+# The official openxr_loader.dll should be installed separately via the
+# Khronos OpenXR SDK installer (https://github.com/KhronosGroup/OpenXR-SDK-Source/releases).
+set(BUILD_LOADER  OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(OpenXR-SDK)
@@ -209,15 +210,61 @@ foreach(_file
         "${CMAKE_SOURCE_DIR}/README.md"
 )
 
-# Copy the OpenXR loader DLL so the release folder is self-contained.
-# The loader is built by FetchContent's OpenXR-SDK; its output location
-# is the same per-config subdirectory as our own DLL.
-add_custom_command(TARGET xr3dv POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:openxr_loader>"
-            "${RELEASE_DIR}/openxr_loader.dll"
-    COMMENT "Copying openxr_loader.dll -> ${RELEASE_DIR}"
-)
+# ---------------------------------------------------------------------------
+# openxr_loader.dll — locate the official pre-installed Khronos SDK DLL.
+#
+# Search order:
+#   1. OPENXR_LOADER_DLL cmake cache variable (user override)
+#   2. Next to xr3dv.dll already (user placed it manually — do nothing)
+#   3. Khronos OpenXR SDK install: registry HKLM\SOFTWARE\Khronos\OpenXR\1\SDKBin
+#   4. Common SDK install paths
+#
+# If not found, a BUILD_WARNING is issued and the DLL must be placed manually.
+# Do NOT use the loader built from FetchContent — it may mismatch the target
+# arch or build config and produce a "not designed to run on Windows" error.
+# ---------------------------------------------------------------------------
+set(OPENXR_LOADER_DLL "" CACHE FILEPATH
+    "Path to official openxr_loader.dll from the Khronos OpenXR SDK installer")
+
+if(NOT OPENXR_LOADER_DLL)
+    # Try registry (Khronos SDK installer writes this)
+    get_filename_component(_SDK_BIN
+        "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Khronos\\OpenXR\\1;SDKBin]"
+        ABSOLUTE)
+    if(EXISTS "${_SDK_BIN}/openxr_loader.dll")
+        set(OPENXR_LOADER_DLL "${_SDK_BIN}/openxr_loader.dll")
+    endif()
+endif()
+
+if(NOT OPENXR_LOADER_DLL)
+    # Common manual install paths
+    foreach(_candidate
+        "C:/Program Files/Khronos/OpenXR/bin/openxr_loader.dll"
+        "C:/Program Files (x86)/Khronos/OpenXR/bin/openxr_loader.dll"
+    )
+        if(EXISTS "${_candidate}")
+            set(OPENXR_LOADER_DLL "${_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(OPENXR_LOADER_DLL)
+    message(STATUS "Found openxr_loader.dll: ${OPENXR_LOADER_DLL}")
+    add_custom_command(TARGET xr3dv POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${OPENXR_LOADER_DLL}"
+                "${RELEASE_DIR}/openxr_loader.dll"
+        COMMENT "Copying openxr_loader.dll -> ${RELEASE_DIR}"
+    )
+    install(FILES "${OPENXR_LOADER_DLL}" DESTINATION .)
+else()
+    message(WARNING
+        "openxr_loader.dll not found. "
+        "Install the Khronos OpenXR SDK from "
+        "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases "
+        "or set OPENXR_LOADER_DLL to the correct path and re-run CMake.")
+endif()
     add_custom_command(TARGET xr3dv POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_file}"
@@ -229,7 +276,7 @@ endforeach()
 # ---------------------------------------------------------------------------
 # cmake --install support (for packagers / CI)
 # ---------------------------------------------------------------------------
-install(TARGETS xr3dv xr3dv_diag openxr_loader RUNTIME DESTINATION .)
+install(TARGETS xr3dv xr3dv_diag RUNTIME DESTINATION .)
 install(FILES   "${RUNTIME_JSON_OUT}"                              DESTINATION .)
 install(FILES   "${CMAKE_SOURCE_DIR}/config/xr3dv.ini.example"    DESTINATION .)
 install(FILES   "${CMAKE_SOURCE_DIR}/scripts/install.ps1"         DESTINATION .)

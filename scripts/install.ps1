@@ -7,17 +7,17 @@
 #   .\install.ps1                   # auto-detect dir, HKCU + HKLM (if admin)
 #   .\install.ps1 -InstallDir <p>   # explicit install directory
 #   .\install.ps1 -UserOnly         # HKCU only, no admin needed
+#   .\install.ps1 -NoWow64          # skip WOW6432Node (32-bit) registration
 #   .\install.ps1 -Uninstall        # remove registration
 
 param(
     [string]$InstallDir = '',
     [switch]$UserOnly,
+    [switch]$NoWow64,
     [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
-# NOTE: StrictMode intentionally omitted - it causes false positives when
-# reading registry properties that may not exist yet.
 
 # ---------------------------------------------------------------------------
 # Safe registry read: returns $null instead of throwing when key/value absent
@@ -75,31 +75,29 @@ function Update-JsonLibraryPath {
 # Register runtime in one registry hive
 # ---------------------------------------------------------------------------
 function Register-Runtime {
-    param([string]$Hive, [string]$JsonAbsPath)
-    $key = $Hive + ':\SOFTWARE\Khronos\OpenXR\1'
+    param([string]$Hive, [string]$JsonAbsPath, [bool]$Wow64 = $false)
+    $subkey = if ($Wow64) { 'SOFTWARE\WOW6432Node\Khronos\OpenXR\1' } else { 'SOFTWARE\Khronos\OpenXR\1' }
+    $key    = $Hive + ':\' + $subkey
+    $label  = if ($Wow64) { $Hive + ' WOW64' } else { $Hive }
 
-    # Ensure the key exists
     if (-not (Test-Path $key)) {
         New-Item -Path $key -Force | Out-Null
-        Write-Host ('  [' + $Hive + '] Created registry key.')
+        Write-Host ('  [' + $label + '] Created registry key.')
     }
 
-    # Back up whatever is currently active (only if it is not already XR3DV)
     $cur = Get-RegValue -Path $key -Name 'ActiveRuntime'
     if (($null -ne $cur) -and ($cur -notlike '*xr3dv*')) {
-        Write-Host ('  [' + $Hive + '] Backing up existing runtime: ' + $cur)
+        Write-Host ('  [' + $label + '] Backing up existing runtime: ' + $cur)
         Set-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -Value $cur
     }
 
-    # Write the new value
     Set-ItemProperty -Path $key -Name 'ActiveRuntime' -Type String -Value $JsonAbsPath
 
-    # Read back to confirm
     $rb = Get-RegValue -Path $key -Name 'ActiveRuntime'
     if ($rb -eq $JsonAbsPath) {
-        Write-Host ('  [' + $Hive + '] OK: ' + $JsonAbsPath)
+        Write-Host ('  [' + $label + '] OK: ' + $JsonAbsPath)
     } else {
-        Write-Warning ('  [' + $Hive + '] Readback mismatch. Got: ' + $rb)
+        Write-Warning ('  [' + $label + '] Readback mismatch. Got: ' + $rb)
     }
 }
 
@@ -107,21 +105,28 @@ function Register-Runtime {
 # Uninstall path
 # ---------------------------------------------------------------------------
 if ($Uninstall) {
-    foreach ($hive in @('HKLM', 'HKCU')) {
-        $key = $hive + ':\SOFTWARE\Khronos\OpenXR\1'
+    $paths = @(
+        @{ Hive = 'HKCU'; Sub = 'SOFTWARE\Khronos\OpenXR\1' },
+        @{ Hive = 'HKLM'; Sub = 'SOFTWARE\Khronos\OpenXR\1' },
+        @{ Hive = 'HKCU'; Sub = 'SOFTWARE\WOW6432Node\Khronos\OpenXR\1' },
+        @{ Hive = 'HKLM'; Sub = 'SOFTWARE\WOW6432Node\Khronos\OpenXR\1' }
+    )
+    foreach ($p in $paths) {
+        $key = $p.Hive + ':\' + $p.Sub
+        if (-not (Test-Path $key)) { continue }
         $cur = Get-RegValue -Path $key -Name 'ActiveRuntime'
-        if ($null -ne $cur -and $cur -like '*xr3dv*') {
-            $bk = Get-RegValue -Path $key -Name 'ActiveRuntime_XR3DV_Backup'
-            if ($null -ne $bk) {
-                Set-ItemProperty -Path $key -Name 'ActiveRuntime' -Value $bk
-                Remove-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue
-                Write-Host ('[' + $hive + '] Restored: ' + $bk)
-            } else {
-                Remove-ItemProperty -Path $key -Name 'ActiveRuntime' -ErrorAction SilentlyContinue
-                Write-Host ('[' + $hive + '] Removed (no backup found).')
-            }
+        if ($null -eq $cur -or $cur -notlike '*xr3dv*') {
+            Write-Host ('[' + $p.Hive + '\' + $p.Sub + '] XR3DV was not active - skipped.')
+            continue
+        }
+        $bk = Get-RegValue -Path $key -Name 'ActiveRuntime_XR3DV_Backup'
+        if ($null -ne $bk) {
+            Set-ItemProperty -Path $key -Name 'ActiveRuntime' -Value $bk
+            Remove-ItemProperty -Path $key -Name 'ActiveRuntime_XR3DV_Backup' -ErrorAction SilentlyContinue
+            Write-Host ('[' + $p.Hive + '\' + $p.Sub + '] Restored: ' + $bk)
         } else {
-            Write-Host ('[' + $hive + '] XR3DV was not active - skipped.')
+            Remove-ItemProperty -Path $key -Name 'ActiveRuntime' -ErrorAction SilentlyContinue
+            Write-Host ('[' + $p.Hive + '\' + $p.Sub + '] Removed (no backup found).')
         }
     }
     Write-Host 'Uninstall complete.'
@@ -139,11 +144,20 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 
 Write-Host ''
 Write-Host 'Registering in HKCU (per-user, loader priority)...'
-Register-Runtime -Hive 'HKCU' -JsonAbsPath $absJson
+Register-Runtime -Hive 'HKCU' -JsonAbsPath $absJson -Wow64 $false
+
+if (-not $NoWow64) {
+    Write-Host 'Registering in HKCU WOW6432Node (32-bit app support)...'
+    Register-Runtime -Hive 'HKCU' -JsonAbsPath $absJson -Wow64 $true
+}
 
 if ($isAdmin -and -not $UserOnly) {
     Write-Host 'Registering in HKLM (system-wide)...'
-    Register-Runtime -Hive 'HKLM' -JsonAbsPath $absJson
+    Register-Runtime -Hive 'HKLM' -JsonAbsPath $absJson -Wow64 $false
+    if (-not $NoWow64) {
+        Write-Host 'Registering in HKLM WOW6432Node (32-bit app support)...'
+        Register-Runtime -Hive 'HKLM' -JsonAbsPath $absJson -Wow64 $true
+    }
 } elseif (-not $isAdmin) {
     Write-Host '  [HKLM] Skipped - run as Administrator for system-wide registration.'
 }
@@ -179,7 +193,10 @@ try {
 }
 
 Write-Host ''
-Write-Host '================================================'
+Write-Host '=================================================='
 Write-Host ' XR3DV registered as the active OpenXR runtime.'
+Write-Host ' 64-bit and 32-bit (WOW64) registry keys written.'
 Write-Host ' Run xr3dv_diag.exe to verify the full stack.'
-Write-Host '================================================'
+Write-Host '  NOTE: 32-bit apps need a separate xr3dv_x86.dll.'
+Write-Host '  Build with: cmake -A Win32 -B build32'
+Write-Host '=================================================='

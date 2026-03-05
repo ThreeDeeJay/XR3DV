@@ -35,7 +35,12 @@ static HWND CreateHiddenWindow() {
         0, 0, 1, 1,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    ShowWindow(hw, SW_HIDE);
+    // 3D Vision's stereo driver only activates on a non-hidden window.
+    // Show it minimised so it doesn't appear in the taskbar but is still
+    // "visible" to NVAPI.  We use TOPMOST so the 1×1 pixel doesn't
+    // flicker under other windows.
+    SetWindowPos(hw, HWND_TOPMOST, 0, 0, 1, 1,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return hw;
 }
 
@@ -101,7 +106,11 @@ bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height) {
     pp.hDeviceWindow            = m_hwnd;
     pp.Windowed                 = TRUE;
     pp.EnableAutoDepthStencil   = FALSE;
-    pp.PresentationInterval     = D3DPRESENT_INTERVAL_ONE;
+    // INTERVAL_IMMEDIATE: never block for vsync in PresentEx.
+    // xrWaitFrame's Sleep() handles frame pacing.  Using INTERVAL_ONE here
+    // causes PresentEx to wait for DWM composition of our hidden window,
+    // which never fires → infinite hang.
+    pp.PresentationInterval     = D3DPRESENT_INTERVAL_IMMEDIATE;
 
     hr = m_d3d9->CreateDeviceEx(
         D3DADAPTER_DEFAULT,
@@ -167,7 +176,8 @@ bool NvapiStereoPresenter::PresentStereoFrame(
     if (!m_initialised) return false;
 
     // Blit left eye --------------------------------------------------------
-    if (!BlitD3D11ToD3D9(leftSRV, d3d11Dev, m_leftSurface.Get())) return false;
+    if (!BlitD3D11ToD3D9(leftSRV, d3d11Dev, m_leftSurface.Get(),
+                          m_stagingTex, m_sysMemLeft)) return false;
 
     // Tell NVAPI we're about to write the left eye
     NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_LEFT);
@@ -178,7 +188,8 @@ bool NvapiStereoPresenter::PresentStereoFrame(
         D3DTEXF_LINEAR);
 
     // Blit right eye -------------------------------------------------------
-    if (!BlitD3D11ToD3D9(rightSRV, d3d11Dev, m_rightSurface.Get())) return false;
+    if (!BlitD3D11ToD3D9(rightSRV, d3d11Dev, m_rightSurface.Get(),
+                          m_stagingTexRight, m_sysMemRight)) return false;
 
     NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
 
@@ -207,9 +218,11 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 // handles) to avoid the CPU copy and its latency.
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::BlitD3D11ToD3D9(
-    ID3D11ShaderResourceView* srv,
-    ID3D11Device*             d3d11Dev,
-    IDirect3DSurface9*        dst)
+    ID3D11ShaderResourceView*                  srv,
+    ID3D11Device*                              d3d11Dev,
+    IDirect3DSurface9*                         dst,
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>&   stagingTex,
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>& sysMemSurf)
 {
     // ---- Resolve the SRV to a texture ------------------------------------
     ComPtr<ID3D11Resource> res;
@@ -224,11 +237,12 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     srcTex->GetDesc(&srcDesc);
 
     // ---- Ensure staging texture exists and matches dims ------------------
-    if (!m_stagingTex ||
+    if (!stagingTex ||
         m_stagingWidth  != srcDesc.Width ||
         m_stagingHeight != srcDesc.Height)
     {
-        m_stagingTex.Reset();
+        stagingTex.Reset();
+        sysMemSurf.Reset();  // invalidate paired SYSMEM surface
         m_stagingWidth  = srcDesc.Width;
         m_stagingHeight = srcDesc.Height;
 
@@ -237,50 +251,43 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
         stDesc.Height         = srcDesc.Height;
         stDesc.MipLevels      = 1;
         stDesc.ArraySize      = 1;
-        stDesc.Format         = DXGI_FORMAT_B8G8R8A8_UNORM; // matches D3D9 BGRA
+        stDesc.Format         = DXGI_FORMAT_B8G8R8A8_UNORM;
         stDesc.SampleDesc     = {1, 0};
         stDesc.Usage          = D3D11_USAGE_STAGING;
         stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-        ComPtr<ID3D11Device> dev = d3d11Dev;
-        if (FAILED(dev->CreateTexture2D(&stDesc, nullptr, &m_stagingTex))) {
+        if (FAILED(d3d11Dev->CreateTexture2D(&stDesc, nullptr, &stagingTex))) {
             LOG_ERROR("Failed to create D3D11 staging texture");
             return false;
         }
     }
 
-    // ---- Copy D3D11 tex → staging ----------------------------------------
-    ComPtr<ID3D11DeviceContext> ctx;
-    d3d11Dev->GetImmediateContext(&ctx);
-
-    // If the source format differs (e.g. RGBA not BGRA), a full CopyResource
-    // may require a CS conversion pass.  For simplicity we assume the OpenXR
-    // app is using BGRA or RGBA and the GPU driver handles it; if not, add a
-    // pixel shader blit here.
-    ctx->CopyResource(m_stagingTex.Get(), srcTex.Get());
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = ctx->Map(m_stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) { LOG_ERROR("D3D11 Map staging failed: 0x%08X", hr); return false; }
-
-    // ---- Lock D3D9 SYSMEM surface and copy row by row --------------------
-    // We use an intermediate SYSMEM surface for the lock.
-    ComPtr<IDirect3DSurface9> sysSurf;
-    HRESULT hrd = m_device->CreateOffscreenPlainSurface(
-        m_stagingWidth, m_stagingHeight,
-        D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
-        &sysSurf, nullptr);
-
-    if (FAILED(hrd)) {
-        ctx->Unmap(m_stagingTex.Get(), 0);
-        LOG_ERROR("CreateOffscreenPlainSurface (sysmem) failed: 0x%08X", hrd);
-        return false;
+    // ---- Ensure SYSMEM surface is allocated (cached, not per-frame) ------
+    if (!sysMemSurf) {
+        HRESULT hrd = m_device->CreateOffscreenPlainSurface(
+            m_stagingWidth, m_stagingHeight,
+            D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+            &sysMemSurf, nullptr);
+        if (FAILED(hrd)) {
+            LOG_ERROR("CreateOffscreenPlainSurface (sysmem) failed: 0x%08X", hrd);
+            return false;
+        }
     }
 
+    // ---- Copy D3D11 tex -> staging ----------------------------------------
+    ComPtr<ID3D11DeviceContext> ctx;
+    d3d11Dev->GetImmediateContext(&ctx);
+    ctx->CopyResource(stagingTex.Get(), srcTex.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) { LOG_ERROR("D3D11 Map staging failed: 0x%08X", hr); return false; }
+
+    // ---- Copy row-by-row into cached SYSMEM surface ----------------------
     D3DLOCKED_RECT lr{};
-    hrd = sysSurf->LockRect(&lr, nullptr, D3DLOCK_DISCARD);
+    HRESULT hrd = sysMemSurf->LockRect(&lr, nullptr, D3DLOCK_DISCARD);
     if (FAILED(hrd)) {
-        ctx->Unmap(m_stagingTex.Get(), 0);
+        ctx->Unmap(stagingTex.Get(), 0);
         LOG_ERROR("LockRect failed: 0x%08X", hrd);
         return false;
     }
@@ -295,11 +302,11 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
                rowBytes);
     }
 
-    sysSurf->UnlockRect();
-    ctx->Unmap(m_stagingTex.Get(), 0);
+    sysMemSurf->UnlockRect();
+    ctx->Unmap(stagingTex.Get(), 0);
 
-    // ---- UpdateSurface: SYSMEM → DEFAULT pool ----------------------------
-    hrd = m_device->UpdateSurface(sysSurf.Get(), nullptr, dst, nullptr);
+    // ---- UpdateSurface: SYSMEM -> DEFAULT pool ---------------------------
+    hrd = m_device->UpdateSurface(sysMemSurf.Get(), nullptr, dst, nullptr);
     if (FAILED(hrd)) {
         LOG_ERROR("UpdateSurface failed: 0x%08X", hrd);
         return false;
@@ -328,6 +335,9 @@ NvapiStereoPresenter::~NvapiStereoPresenter() {
     m_leftSurface.Reset();
     m_rightSurface.Reset();
     m_stagingTex.Reset();
+    m_stagingTexRight.Reset();
+    m_sysMemLeft.Reset();
+    m_sysMemRight.Reset();
 
     if (m_stereoHandle) {
         NvAPI_Stereo_DestroyHandle(m_stereoHandle);
