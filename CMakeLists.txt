@@ -22,9 +22,11 @@ FetchContent_Declare(
     GIT_TAG        release-1.0.34
     GIT_SHALLOW    TRUE
 )
-# We only need headers, not the loader library itself
-set(BUILD_LOADER OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTS  OFF CACHE BOOL "" FORCE)
+# We need the loader DLL for apps that ship without their own copy, and for
+# xr3dv_diag section 5 to test the full system path.
+set(BUILD_LOADER  ON  CACHE BOOL "" FORCE)
+set(BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(OpenXR-SDK)
 
 # ---------------------------------------------------------------------------
@@ -206,6 +208,16 @@ foreach(_file
         "${CMAKE_SOURCE_DIR}/config/xr3dv.ini.example"
         "${CMAKE_SOURCE_DIR}/README.md"
 )
+
+# Copy the OpenXR loader DLL so the release folder is self-contained.
+# The loader is built by FetchContent's OpenXR-SDK; its output location
+# is the same per-config subdirectory as our own DLL.
+add_custom_command(TARGET xr3dv POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:openxr_loader>"
+            "${RELEASE_DIR}/openxr_loader.dll"
+    COMMENT "Copying openxr_loader.dll -> ${RELEASE_DIR}"
+)
     add_custom_command(TARGET xr3dv POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_file}"
@@ -217,7 +229,7 @@ endforeach()
 # ---------------------------------------------------------------------------
 # cmake --install support (for packagers / CI)
 # ---------------------------------------------------------------------------
-install(TARGETS xr3dv xr3dv_diag RUNTIME DESTINATION .)
+install(TARGETS xr3dv xr3dv_diag openxr_loader RUNTIME DESTINATION .)
 install(FILES   "${RUNTIME_JSON_OUT}"                              DESTINATION .)
 install(FILES   "${CMAKE_SOURCE_DIR}/config/xr3dv.ini.example"    DESTINATION .)
 install(FILES   "${CMAKE_SOURCE_DIR}/scripts/install.ps1"         DESTINATION .)

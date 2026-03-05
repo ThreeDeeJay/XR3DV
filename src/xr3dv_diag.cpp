@@ -492,14 +492,16 @@ static void CheckOpenXRLoader() {
                 for (auto& e : exts) {
                     INFO("  Extension", "%s (v%u)", e.extensionName, e.extensionVersion);
                 }
-                // Check for D3D11 extension (mandatory for XR3DV)
-                bool hasD3D11 = false;
+                // Check for required and important extensions
+                bool hasD3D11 = false, hasDepth = false;
                 for (auto& e : exts) {
-                    if (strcmp(e.extensionName, "XR_KHR_D3D11_enable") == 0)
-                        hasD3D11 = true;
+                    if (strcmp(e.extensionName, "XR_KHR_D3D11_enable") == 0)            hasD3D11 = true;
+                    if (strcmp(e.extensionName, "XR_KHR_composition_layer_depth") == 0) hasDepth = true;
                 }
                 if (hasD3D11) PASS("XR_KHR_D3D11_enable present", "Required extension found");
-                else          FAIL("XR_KHR_D3D11_enable present", "MISSING — XR3DV requires this");
+                else          FAIL("XR_KHR_D3D11_enable present", "MISSING -- XR3DV requires this");
+                if (hasDepth) PASS("XR_KHR_composition_layer_depth", "Present (depth swapchains supported)");
+                else          WARN("XR_KHR_composition_layer_depth", "Missing -- hello_xr will skip depth submission");
             } else {
                 FAIL("xrEnumInstanceExtProps", "Returned %d", (int)r);
             }

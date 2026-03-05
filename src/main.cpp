@@ -49,8 +49,18 @@ xrNegotiateLoaderRuntimeInterface(
 // ---------------------------------------------------------------------------
 // Supported extensions
 // ---------------------------------------------------------------------------
-static const char* const kSupportedExtensions[] = {
-    "XR_KHR_D3D11_enable",
+struct ExtensionEntry { const char* name; uint32_t version; };
+static const ExtensionEntry kSupportedExtensions[] = {
+    // Graphics binding — required
+    { "XR_KHR_D3D11_enable",                         1 },
+    // Depth layer — we accept (and ignore) depth swapchains, matching real runtimes
+    { "XR_KHR_composition_layer_depth",               6 },
+    // Debug utils — stub: xrCreateDebugUtilsMessengerEXT returns SUCCESS
+    { "XR_EXT_debug_utils",                           5 },
+    // Win32 time conversion — trivial: QPC ↔ XrTime are the same unit here
+    { "XR_KHR_win32_convert_performance_counter_time", 1 },
+    // Visibility mask — stub: returns empty mesh (no occlusion mask for 3DV)
+    { "XR_KHR_visibility_mask",                       2 },
 };
 static const uint32_t kSupportedExtCount =
     static_cast<uint32_t>(std::size(kSupportedExtensions));
@@ -83,9 +93,9 @@ xrEnumerateInstanceExtensionProperties(const char* /*layerName*/,
     for (uint32_t i = 0; i < kSupportedExtCount; ++i) {
         props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
         props[i].next = nullptr;
-        strncpy_s(props[i].extensionName, kSupportedExtensions[i],
+        strncpy_s(props[i].extensionName, kSupportedExtensions[i].name,
                   XR_MAX_EXTENSION_NAME_SIZE - 1);
-        props[i].extensionVersion = 1;
+        props[i].extensionVersion = kSupportedExtensions[i].version;
     }
     return XR_SUCCESS;
 }
@@ -185,7 +195,7 @@ xrGetSystemProperties(XrInstance /*instance*/,
 }
 
 // ---------------------------------------------------------------------------
-// xrPollEvent
+// xrPollEvent — drain the runtime event queue
 // ---------------------------------------------------------------------------
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
 xrPollEvent(XrInstance /*instance*/, XrEventDataBuffer* eventData)
@@ -193,21 +203,18 @@ xrPollEvent(XrInstance /*instance*/, XrEventDataBuffer* eventData)
     xr3dv::Runtime* rt = xr3dv::GetRuntime();
     if (!rt) return XR_EVENT_UNAVAILABLE;
 
-    // Check if any session needs a state change event delivered
-    std::lock_guard<std::mutex> lk(rt->sessionMtx);
-    for (auto& [handle, sess] : rt->sessions) {
-        XrSessionState st = sess->State();
-        if (st == XR_SESSION_STATE_EXITING) {
-            auto* ev = reinterpret_cast<XrEventDataSessionStateChanged*>(eventData);
-            ev->type    = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
-            ev->next    = nullptr;
-            ev->session = reinterpret_cast<XrSession>(handle);
-            ev->state   = XR_SESSION_STATE_EXITING;
-            ev->time    = xr3dv::FrameTimer::NowNs();
-            return XR_SUCCESS;
-        }
+    std::lock_guard<std::mutex> lk(rt->eventMtx);
+    if (rt->eventQueue.empty()) return XR_EVENT_UNAVAILABLE;
+
+    *eventData = rt->eventQueue.front();
+    rt->eventQueue.pop_front();
+
+    // Log the delivered event for diagnostics
+    if (eventData->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+        const auto* ev = reinterpret_cast<const XrEventDataSessionStateChanged*>(eventData);
+        LOG_VERBOSE("xrPollEvent: session state -> %d", (int)ev->state);
     }
-    return XR_EVENT_UNAVAILABLE;
+    return XR_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +420,14 @@ xrCreateSession(XrInstance /*instance*/,
     uint64_t h = rt->nextSessionHandle++;
     rt->sessions[h] = std::move(sess);
     *session = reinterpret_cast<XrSession>(h);
+
+    // Per OpenXR spec the runtime must deliver session state transitions via
+    // xrPollEvent before the app can call xrBeginSession.
+    // Queue: UNKNOWN → IDLE → READY so the app's event loop unblocks.
+    XrTime now = xr3dv::FrameTimer::NowNs();
+    XrSession xrSess = reinterpret_cast<XrSession>(h);
+    rt->PushSessionStateEvent(xrSess, XR_SESSION_STATE_IDLE,  now);
+    rt->PushSessionStateEvent(xrSess, XR_SESSION_STATE_READY, now);
     return XR_SUCCESS;
 }
 
@@ -439,19 +454,45 @@ xrDestroySession(XrSession session)
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
 xrBeginSession(XrSession session, const XrSessionBeginInfo* info)
 {
-    GET_SESSION(session); return sess->Begin(info);
+    GET_SESSION(session);
+    XrResult r = sess->Begin(info);
+    if (r == XR_SUCCESS) {
+        // Transition through SYNCHRONIZED → VISIBLE → FOCUSED so the app
+        // enters its frame loop.  We skip SYNCHRONIZED/VISIBLE dwell time
+        // since XR3DV has no display compositor arbitration.
+        XrTime now = xr3dv::FrameTimer::NowNs();
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_SYNCHRONIZED, now);
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_VISIBLE,      now);
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_FOCUSED,      now);
+    }
+    return r;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
 xrEndSession(XrSession session)
 {
-    GET_SESSION(session); return sess->End();
+    GET_SESSION(session);
+    XrResult r = sess->End();
+    if (r == XR_SUCCESS) {
+        XrTime now = xr3dv::FrameTimer::NowNs();
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_STOPPING, now);
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_IDLE,     now);
+    }
+    return r;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
 xrRequestExitSession(XrSession session)
 {
-    GET_SESSION(session); return sess->RequestExit();
+    GET_SESSION(session);
+    XrResult r = sess->RequestExit();
+    if (r == XR_SUCCESS) {
+        XrTime now = xr3dv::FrameTimer::NowNs();
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_STOPPING, now);
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_IDLE,     now);
+        rt->PushSessionStateEvent(session, XR_SESSION_STATE_EXITING,  now);
+    }
+    return r;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
@@ -582,6 +623,60 @@ xrReleaseSwapchainImage(XrSwapchain swapchain,
 }
 
 // ---------------------------------------------------------------------------
+// Extension stubs
+// ---------------------------------------------------------------------------
+
+// XR_EXT_debug_utils — accept messenger creation, do nothing with it
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrCreateDebugUtilsMessengerEXT(XrInstance /*instance*/,
+    const XrDebugUtilsMessengerCreateInfoEXT* /*createInfo*/,
+    XrDebugUtilsMessengerEXT* messenger)
+{
+    if (messenger) *messenger = reinterpret_cast<XrDebugUtilsMessengerEXT>(1);
+    return XR_SUCCESS;
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrDestroyDebugUtilsMessengerEXT(XrDebugUtilsMessengerEXT /*messenger*/)
+{
+    return XR_SUCCESS;
+}
+
+// XR_KHR_win32_convert_performance_counter_time
+// XrTime == QPC value in 100ns units in this runtime, so conversion is 1:1.
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrConvertWin32PerformanceCounterToTimeKHR(XrInstance /*instance*/,
+    const LARGE_INTEGER* performanceCounter, XrTime* time)
+{
+    if (!performanceCounter || !time) return XR_ERROR_VALIDATION_FAILURE;
+    *time = static_cast<XrTime>(performanceCounter->QuadPart);
+    return XR_SUCCESS;
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrConvertTimeToWin32PerformanceCounterKHR(XrInstance /*instance*/,
+    XrTime time, LARGE_INTEGER* performanceCounter)
+{
+    if (!performanceCounter) return XR_ERROR_VALIDATION_FAILURE;
+    performanceCounter->QuadPart = static_cast<LONGLONG>(time);
+    return XR_SUCCESS;
+}
+
+// XR_KHR_visibility_mask — return an empty mask (no occlusion zones for 3DV)
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVisibilityMaskKHR(XrSession /*session*/,
+    XrViewConfigurationType /*viewConfigurationType*/,
+    uint32_t /*viewIndex*/,
+    XrVisibilityMaskTypeKHR /*visibilityMaskType*/,
+    XrVisibilityMaskKHR* visibilityMask)
+{
+    if (!visibilityMask) return XR_ERROR_VALIDATION_FAILURE;
+    visibilityMask->vertexCountOutput  = 0;
+    visibilityMask->indexCountOutput   = 0;
+    return XR_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 // xrGetInstanceProcAddr — function pointer dispatch table
 // ---------------------------------------------------------------------------
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
@@ -645,6 +740,14 @@ xrGetInstanceProcAddr(XrInstance /*instance*/, const char* name,
     DISPATCH(xrApplyHapticFeedback)
     DISPATCH(xrStopHapticFeedback)
     DISPATCH(xrGetD3D11GraphicsRequirementsKHR)
+    // XR_EXT_debug_utils
+    DISPATCH(xrCreateDebugUtilsMessengerEXT)
+    DISPATCH(xrDestroyDebugUtilsMessengerEXT)
+    // XR_KHR_win32_convert_performance_counter_time
+    DISPATCH(xrConvertWin32PerformanceCounterToTimeKHR)
+    DISPATCH(xrConvertTimeToWin32PerformanceCounterKHR)
+    // XR_KHR_visibility_mask
+    DISPATCH(xrGetVisibilityMaskKHR)
 #undef DISPATCH
 
     *function = nullptr;

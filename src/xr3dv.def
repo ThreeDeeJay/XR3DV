@@ -64,3 +64,14 @@ EXPORTS
 
     ; D3D11 graphics binding (XR_KHR_D3D11_enable)
     xrGetD3D11GraphicsRequirementsKHR
+
+    ; Debug utils (XR_EXT_debug_utils)
+    xrCreateDebugUtilsMessengerEXT
+    xrDestroyDebugUtilsMessengerEXT
+
+    ; Win32 time conversion (XR_KHR_win32_convert_performance_counter_time)
+    xrConvertWin32PerformanceCounterToTimeKHR
+    xrConvertTimeToWin32PerformanceCounterKHR
+
+    ; Visibility mask (XR_KHR_visibility_mask)
+    xrGetVisibilityMaskKHR
