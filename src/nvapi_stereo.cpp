@@ -2,8 +2,9 @@
 //  Copyright (C) 2026 XR3DV Contributors
 //  SPDX-License-Identifier: GPL-3.0-or-later
 //
-//  NVAPI stereo bridge: creates a hidden D3D9Ex device, enables NVAPI
-//  stereo mode, and blits D3D11 left/right eye textures into it each frame.
+//  NVAPI stereo bridge: creates a fullscreen-exclusive D3D9Ex device,
+//  enables NVAPI stereo mode, and blits D3D11 left/right eye textures
+//  into it each frame.  FSE is required for 3D Vision on drivers >= 426.06.
 
 #include "pch.h"
 #include "nvapi_stereo.h"
@@ -18,9 +19,9 @@ using Microsoft::WRL::ComPtr;
 namespace xr3dv {
 
 // ---------------------------------------------------------------------------
-// Hidden window for D3D9 presentation
+// Window for FSE D3D9 presentation
 // ---------------------------------------------------------------------------
-static HWND CreatePresentationWindow(uint32_t width, uint32_t height) {
+static HWND CreatePresentationWindow() {
     static const wchar_t kClass[] = L"XR3DV_D3D9";
 
     WNDCLASSEXW wc{};
@@ -28,37 +29,41 @@ static HWND CreatePresentationWindow(uint32_t width, uint32_t height) {
     wc.lpfnWndProc   = DefWindowProcW;
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.lpszClassName = kClass;
-    RegisterClassExW(&wc); // ignore "already registered"
+    RegisterClassExW(&wc);
 
-    // Center the window on the primary monitor.
-    // The window must be the same size as the D3D9 back buffer so DWM
-    // doesn't clip the presentation, and must be visible so the 3D Vision
-    // driver can activate the stereo signal.
-    int sx = GetSystemMetrics(SM_CXSCREEN);
-    int sy = GetSystemMetrics(SM_CYSCREEN);
-    int x  = (sx - (int)width)  / 2;
-    int y  = (sy - (int)height) / 2;
-
+    // For FSE the window dimensions don't matter; D3D9 takes over the display.
     HWND hw = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        kClass, L"XR3DV",
-        WS_POPUP,           // borderless — no title bar or borders
-        x, y, (int)width, (int)height,
+        0, kClass, L"XR3DV", WS_POPUP,
+        0, 0, 1, 1,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    LOG_INFO("D3D9 presentation window: %dx%d at (%d,%d) HWND=%p",
-             (int)width, (int)height, x, y, (void*)hw);
-
-    // Show without stealing focus, but visible so NVAPI can latch onto it.
     ShowWindow(hw, SW_SHOWNOACTIVATE);
-    UpdateWindow(hw);
     return hw;
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated Win32 message-pump thread
+// ---------------------------------------------------------------------------
+void NvapiStereoPresenter::MsgThreadProc() {
+    // Messages for m_hwnd must be pumped on the thread that created it.
+    while (!m_msgStop.load(std::memory_order_relaxed)) {
+        MSG msg;
+        if (MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT,
+                                         MWMO_INPUTAVAILABLE) != WAIT_TIMEOUT) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) { m_msgStop = true; return; }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // NvapiStereoPresenter::Init
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
+                                 uint32_t frameRate,
                                  float separation, float convergence)
 {
     m_width  = width;
@@ -81,60 +86,74 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
         return false;
     }
 
-    // ------ 3. Create D3D9Ex device --------------------------------------
-    if (!CreateD3D9Device(width, height)) return false;
+    // ------ 3. Create window on the message thread -----------------------
+    // Win32 requires messages to be pumped on the thread that created the
+    // window.  Spawn the thread, let it create the window, then wait.
+    m_msgStop = false;
+    m_msgThread = std::thread([this, width, height, frameRate]() {
+        m_hwnd = CreatePresentationWindow();
+        if (m_hwnd) MsgThreadProc();
+    });
 
-    // ------ 4. Create NVAPI stereo handle from the device ----------------
+    for (int i = 0; i < 200 && !m_hwnd; ++i) Sleep(10);
+    if (!m_hwnd) {
+        LOG_ERROR("Timed out waiting for D3D9 presentation window");
+        m_msgStop = true;
+        if (m_msgThread.joinable()) m_msgThread.join();
+        return false;
+    }
+    LOG_INFO("D3D9 presentation window HWND=%p", (void*)m_hwnd);
+
+    // ------ 4. Create FSE D3D9Ex device ----------------------------------
+    if (!CreateD3D9Device(width, height, frameRate)) return false;
+
+    // ------ 5. Create NVAPI stereo handle --------------------------------
     if (!EnableNvStereo()) return false;
 
-    // ------ 5. Create per-eye D3D9 offscreen surfaces --------------------
+    // ------ 6. Create per-eye offscreen surfaces -------------------------
     if (!CreateStagingResources(width, height)) return false;
 
-    // ------ 6. Apply initial parameters ----------------------------------
+    // ------ 7. Apply initial parameters ----------------------------------
     SetSeparation(separation);
     SetConvergence(convergence);
 
     m_initialised = true;
-    LOG_INFO("NvapiStereoPresenter initialised (%ux%u, sep=%.1f, conv=%.2f)",
-             width, height, separation, convergence);
+    LOG_INFO("NvapiStereoPresenter initialised (%ux%u@%uHz FSE, sep=%.1f, conv=%.2f)",
+             width, height, frameRate, separation, convergence);
     return true;
 }
 
 // ---------------------------------------------------------------------------
-bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height) {
-    m_hwnd = CreatePresentationWindow(width, height);
-    if (!m_hwnd) { LOG_ERROR("Failed to create D3D9 presentation window"); return false; }
-
+bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height,
+                                             uint32_t frameRate) {
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
     if (FAILED(hr)) { LOG_ERROR("Direct3DCreate9Ex failed: 0x%08X", hr); return false; }
 
     D3DPRESENT_PARAMETERS pp{};
-    pp.BackBufferWidth          = width;
-    pp.BackBufferHeight         = height;
-    pp.BackBufferFormat         = D3DFMT_A8R8G8B8;
-    pp.BackBufferCount          = 1;
-    pp.SwapEffect               = D3DSWAPEFFECT_DISCARD;
-    pp.hDeviceWindow            = m_hwnd;
-    pp.Windowed                 = TRUE;
-    pp.EnableAutoDepthStencil   = FALSE;
-    // INTERVAL_IMMEDIATE: never block for vsync in PresentEx.
-    // xrWaitFrame's Sleep() handles frame pacing.  Using INTERVAL_ONE here
-    // causes PresentEx to wait for DWM composition of our hidden window,
-    // which never fires → infinite hang.
-    pp.PresentationInterval     = D3DPRESENT_INTERVAL_IMMEDIATE;
+    pp.BackBufferWidth            = width;
+    pp.BackBufferHeight           = height;
+    pp.BackBufferFormat           = D3DFMT_A8R8G8B8;
+    pp.BackBufferCount            = 2;
+    pp.SwapEffect                 = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow              = m_hwnd;
+    pp.Windowed                   = FALSE;           // FULLSCREEN EXCLUSIVE
+    pp.EnableAutoDepthStencil     = FALSE;
+    pp.FullScreen_RefreshRateInHz = frameRate;       // must be 120 for 3D Vision
+    // INTERVAL_ONE works correctly in FSE since DWM is bypassed entirely.
+    pp.PresentationInterval       = D3DPRESENT_INTERVAL_ONE;
 
     hr = m_d3d9->CreateDeviceEx(
-        D3DADAPTER_DEFAULT,
-        D3DDEVTYPE_HAL,
-        m_hwnd,
+        D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, m_hwnd,
         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
-        &pp, nullptr,
-        &m_device);
+        &pp, nullptr, &m_device);
 
     if (FAILED(hr)) {
-        LOG_ERROR("CreateDeviceEx failed: 0x%08X", hr);
+        LOG_ERROR("CreateDeviceEx (FSE %ux%u@%uHz) failed: 0x%08X "
+                  "-- confirm monitor supports this mode and 3D Vision is on",
+                  width, height, frameRate, hr);
         return false;
     }
+    LOG_INFO("D3D9 FSE device: %ux%u@%uHz", width, height, frameRate);
     return true;
 }
 
@@ -208,13 +227,6 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 
     // Present the stereo frame ---------------------------------------------
     LOG_TRACE("PresentStereoFrame: calling PresentEx...");
-    // Pump the window message queue so Windows doesn't mark the window as
-    // "not responding" and so DWM keeps compositing our frames.
-    MSG msg;
-    while (PeekMessageW(&msg, m_hwnd, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
     HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
     if (FAILED(hr)) {
         LOG_ERROR("D3D9 PresentEx failed: 0x%08X", hr);
@@ -377,6 +389,11 @@ NvapiStereoPresenter::~NvapiStereoPresenter() {
 
     m_device.Reset();
     m_d3d9.Reset();
+
+    // Stop the message pump thread before destroying the window.
+    m_msgStop = true;
+    if (m_hwnd) PostMessageW(m_hwnd, WM_QUIT, 0, 0);
+    if (m_msgThread.joinable()) m_msgThread.join();
 
     if (m_hwnd) {
         DestroyWindow(m_hwnd);

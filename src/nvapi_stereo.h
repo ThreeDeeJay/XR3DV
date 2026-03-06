@@ -1,13 +1,11 @@
-//  XR3DV - OpenXR Runtime for NVIDIA 3D Vision
-//  Copyright (C) 2026 XR3DV Contributors
-//  SPDX-License-Identifier: GPL-3.0-or-later
-
 #pragma once
 
 #include <d3d9.h>
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <thread>
+#include <atomic>
 
 // nvapi.h defines StereoHandle, NVDX_ObjectHandle, etc.
 // It must be included before any NVAPI type usage.
@@ -27,38 +25,33 @@ public:
     NvapiStereoPresenter(const NvapiStereoPresenter&)            = delete;
     NvapiStereoPresenter& operator=(const NvapiStereoPresenter&) = delete;
 
-    /// Create hidden D3D9 window + device and initialise NVAPI stereo.
-    /// @param width      Per-eye render width
-    /// @param height     Per-eye render height
-    /// @param separation Initial separation [0–100]
+    /// Create FSE D3D9 device and initialise NVAPI stereo.
+    /// @param width       Per-eye render width
+    /// @param height      Per-eye render height
+    /// @param frameRate   Display refresh rate (Hz) — must be 120 for 3D Vision
+    /// @param separation  Initial separation [0–100]
     /// @param convergence Initial convergence [0–25]
-    bool Init(uint32_t width, uint32_t height,
+    bool Init(uint32_t width, uint32_t height, uint32_t frameRate,
               float separation, float convergence);
 
     /// Present a stereo frame.
-    /// @param leftSRV   D3D11 SRV of the left-eye swapchain image
-    /// @param rightSRV  D3D11 SRV of the right-eye swapchain image
-    /// @param d3d11Dev  The D3D11 device that owns the SRVs
     bool PresentStereoFrame(
         ID3D11ShaderResourceView* leftSRV,
         ID3D11ShaderResourceView* rightSRV,
         ID3D11Device*             d3d11Dev);
 
-    /// Update separation at runtime (hot-reload).
     void SetSeparation(float pct);
-
-    /// Update convergence at runtime (hot-reload).
     void SetConvergence(float val);
-
     bool IsInitialised() const { return m_initialised; }
 
 private:
-    bool CreateD3D9Device(uint32_t width, uint32_t height);
+    bool CreateD3D9Device(uint32_t width, uint32_t height, uint32_t frameRate);
     bool EnableNvStereo();
     bool CreateStagingResources(uint32_t width, uint32_t height);
 
-    /// Read-back D3D11 texture to CPU then upload to D3D9 surface.
-    /// stagingTex and sysMemSurf are cached across frames to avoid per-call allocation.
+    /// Dedicated Win32 message-pump thread: keeps the FSE window alive.
+    void MsgThreadProc();
+
     bool BlitD3D11ToD3D9(
         ID3D11ShaderResourceView*                    srv,
         ID3D11Device*                                d3d11Dev,
@@ -67,34 +60,37 @@ private:
         Microsoft::WRL::ComPtr<IDirect3DSurface9>&   sysMemSurf);
 
     // ------ D3D9 objects -------------------------------------------------
-    HWND                                     m_hwnd           = nullptr;
-    Microsoft::WRL::ComPtr<IDirect3D9Ex>     m_d3d9;
+    HWND                                       m_hwnd           = nullptr;
+    Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer;
 
-    // ------ D3D11 staging textures (one per eye, cached to avoid per-frame alloc)
-    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTex;       // left eye
-    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTexRight;  // right eye
-    uint32_t m_stagingWidth  = 0;
-    uint32_t m_stagingHeight = 0;
+    // ------ D3D11 staging textures (one per eye, cached) -----------------
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTex;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTexRight;
+    uint32_t    m_stagingWidth  = 0;
+    uint32_t    m_stagingHeight = 0;
     DXGI_FORMAT m_stagingFormat = DXGI_FORMAT_UNKNOWN;
 
-    // Cached SYSMEM surfaces for CPU→D3D9 upload (avoids per-frame allocation)
+    // Cached SYSMEM surfaces for CPU→D3D9 upload
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemRight;
 
     // ------ NVAPI ---------------------------------------------------------
-    StereoHandle m_stereoHandle  = nullptr;   ///< NVAPI stereo handle
+    StereoHandle m_stereoHandle = nullptr;
+
+    // ------ Message pump thread -------------------------------------------
+    std::thread       m_msgThread;
+    std::atomic<bool> m_msgStop{false};
 
     // ------ State ---------------------------------------------------------
-    bool     m_initialised   = false;
-    uint32_t m_width         = 0;
-    uint32_t m_height        = 0;
+    bool     m_initialised = false;
+    uint32_t m_width       = 0;
+    uint32_t m_height      = 0;
 };
 
-/// Query whether the NVAPI stereo path is available on this machine.
 bool NvapiIsAvailable();
 
 } // namespace xr3dv

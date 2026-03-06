@@ -44,6 +44,7 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
     // Initialise NVAPI stereo presenter
     m_stereo = std::make_unique<NvapiStereoPresenter>();
     if (!m_stereo->Init(m_cfg.width, m_cfg.height,
+                        m_cfg.frameRate,
                         m_cfg.separation.load(),
                         m_cfg.convergence.load()))
     {
