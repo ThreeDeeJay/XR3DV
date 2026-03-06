@@ -114,12 +114,18 @@ XrResult Session::RequestExit() {
 XrResult Session::WaitFrame(const XrFrameWaitInfo* /*info*/, XrFrameState* state) {
     if (!IsRunning()) return XR_ERROR_SESSION_NOT_RUNNING;
 
-    std::lock_guard<std::mutex> lk(m_frameMtx);
+    // Do NOT hold m_frameMtx across the timer sleep — BeginFrame also needs
+    // that mutex and would deadlock waiting for WaitFrame to release it.
+    int64_t displayTime = m_timer.WaitAndGetNextDisplayTime();
 
-    m_predictedDisplayTime   = m_timer.WaitAndGetNextDisplayTime();
-    state->predictedDisplayTime         = m_predictedDisplayTime;
-    state->predictedDisplayPeriod       = static_cast<XrDuration>(1'000'000'000LL / m_cfg.frameRate);
-    state->shouldRender                 = XR_TRUE;
+    {
+        std::lock_guard<std::mutex> lk(m_frameMtx);
+        m_predictedDisplayTime = displayTime;
+    }
+
+    state->predictedDisplayTime   = displayTime;
+    state->predictedDisplayPeriod = static_cast<XrDuration>(1'000'000'000LL / m_cfg.frameRate);
+    state->shouldRender           = XR_TRUE;
 
     return XR_SUCCESS;
 }

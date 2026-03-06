@@ -236,22 +236,24 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     D3D11_TEXTURE2D_DESC srcDesc{};
     srcTex->GetDesc(&srcDesc);
 
-    // ---- Ensure staging texture exists and matches dims ------------------
+    // ---- Ensure staging texture exists and matches dims AND format -------
     if (!stagingTex ||
         m_stagingWidth  != srcDesc.Width ||
-        m_stagingHeight != srcDesc.Height)
+        m_stagingHeight != srcDesc.Height ||
+        m_stagingFormat != srcDesc.Format)
     {
         stagingTex.Reset();
         sysMemSurf.Reset();  // invalidate paired SYSMEM surface
         m_stagingWidth  = srcDesc.Width;
         m_stagingHeight = srcDesc.Height;
+        m_stagingFormat = srcDesc.Format;
 
         D3D11_TEXTURE2D_DESC stDesc{};
         stDesc.Width          = srcDesc.Width;
         stDesc.Height         = srcDesc.Height;
         stDesc.MipLevels      = 1;
         stDesc.ArraySize      = 1;
-        stDesc.Format         = DXGI_FORMAT_B8G8R8A8_UNORM;
+        stDesc.Format         = srcDesc.Format; // must match exactly for CopyResource
         stDesc.SampleDesc     = {1, 0};
         stDesc.Usage          = D3D11_USAGE_STAGING;
         stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -260,6 +262,8 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
             LOG_ERROR("Failed to create D3D11 staging texture");
             return false;
         }
+        LOG_VERBOSE("Staging texture (re)created: %ux%u fmt=%u",
+                    m_stagingWidth, m_stagingHeight, (unsigned)m_stagingFormat);
     }
 
     // ---- Ensure SYSMEM surface is allocated (cached, not per-frame) ------
@@ -274,29 +278,19 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
         }
     }
 
-    // ---- Copy D3D11 tex -> staging ----------------------------------------
+    // ---- Copy D3D11 tex -> staging and block until GPU is done -----------
     ComPtr<ID3D11DeviceContext> ctx;
     d3d11Dev->GetImmediateContext(&ctx);
     ctx->CopyResource(stagingTex.Get(), srcTex.Get());
-    ctx->Flush(); // ensure CopyResource is submitted before we poll Map
 
-    // Non-blocking Map with retry: avoids stalling the XrEndFrame call if
-    // the GPU hasn't finished yet.  10 ms total budget matches the spin
-    // deadline in WaitFrame so the frame loop stays bounded.
+    // Blocking Map: stalls CPU until CopyResource completes (~0.5–2 ms for
+    // a 1080p texture on a modern GPU).  DO_NOT_WAIT was wrong here because
+    // the staging texture has no fence — the driver must guarantee completion
+    // before Map returns, but only with MapFlags=0.
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = E_FAIL;
-    const DWORD retryDeadlineMs = GetTickCount() + 10;
-    do {
-        hr = ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ,
-                      D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-            if (GetTickCount() > retryDeadlineMs) break;
-            Sleep(0); // yield to let GPU finish
-        }
-    } while (hr == DXGI_ERROR_WAS_STILL_DRAWING);
-
+    HRESULT hr = ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
-        LOG_ERROR("D3D11 Map staging failed: 0x%08X -- skipping frame", hr);
+        LOG_ERROR("D3D11 Map staging failed: 0x%08X", hr);
         return false;
     }
 
