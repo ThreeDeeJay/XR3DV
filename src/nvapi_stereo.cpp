@@ -20,7 +20,7 @@ namespace xr3dv {
 // ---------------------------------------------------------------------------
 // Hidden window for D3D9 presentation
 // ---------------------------------------------------------------------------
-static HWND CreateHiddenWindow() {
+static HWND CreatePresentationWindow(uint32_t width, uint32_t height) {
     static const wchar_t kClass[] = L"XR3DV_D3D9";
 
     WNDCLASSEXW wc{};
@@ -30,17 +30,28 @@ static HWND CreateHiddenWindow() {
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc); // ignore "already registered"
 
+    // Center the window on the primary monitor.
+    // The window must be the same size as the D3D9 back buffer so DWM
+    // doesn't clip the presentation, and must be visible so the 3D Vision
+    // driver can activate the stereo signal.
+    int sx = GetSystemMetrics(SM_CXSCREEN);
+    int sy = GetSystemMetrics(SM_CYSCREEN);
+    int x  = (sx - (int)width)  / 2;
+    int y  = (sy - (int)height) / 2;
+
     HWND hw = CreateWindowExW(
-        0, kClass, L"XR3DV", WS_POPUP,
-        0, 0, 1, 1,
+        WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        kClass, L"XR3DV",
+        WS_POPUP,           // borderless — no title bar or borders
+        x, y, (int)width, (int)height,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    // 3D Vision's stereo driver only activates on a non-hidden window.
-    // Show it minimised so it doesn't appear in the taskbar but is still
-    // "visible" to NVAPI.  We use TOPMOST so the 1×1 pixel doesn't
-    // flicker under other windows.
-    SetWindowPos(hw, HWND_TOPMOST, 0, 0, 1, 1,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    LOG_INFO("D3D9 presentation window: %dx%d at (%d,%d) HWND=%p",
+             (int)width, (int)height, x, y, (void*)hw);
+
+    // Show without stealing focus, but visible so NVAPI can latch onto it.
+    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    UpdateWindow(hw);
     return hw;
 }
 
@@ -91,8 +102,8 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
 
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height) {
-    m_hwnd = CreateHiddenWindow();
-    if (!m_hwnd) { LOG_ERROR("Failed to create hidden D3D9 window"); return false; }
+    m_hwnd = CreatePresentationWindow(width, height);
+    if (!m_hwnd) { LOG_ERROR("Failed to create D3D9 presentation window"); return false; }
 
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
     if (FAILED(hr)) { LOG_ERROR("Direct3DCreate9Ex failed: 0x%08X", hr); return false; }
@@ -197,6 +208,14 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 
     // Present the stereo frame ---------------------------------------------
     LOG_TRACE("PresentStereoFrame: calling PresentEx...");
+    // Pump the window message queue so Windows doesn't mark the window as
+    // "not responding" and so DWM keeps compositing our frames.
+    MSG msg;
+    while (PeekMessageW(&msg, m_hwnd, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
     HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
     if (FAILED(hr)) {
         LOG_ERROR("D3D9 PresentEx failed: 0x%08X", hr);
