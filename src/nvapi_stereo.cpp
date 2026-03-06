@@ -120,22 +120,11 @@ void NvapiStereoPresenter::MsgThreadProc() {
     pp.FullScreen_RefreshRateInHz = m_frameRate;
     pp.PresentationInterval       = D3DPRESENT_INTERVAL_ONE;
 
-    // CreateDeviceEx requires a valid D3DDISPLAYMODEEX for FSE (Windowed=FALSE).
-    // Passing nullptr causes D3DERR_INVALIDCALL unconditionally — this is the
-    // key difference from the legacy CreateDevice API.
-    D3DDISPLAYMODEEX fsMode{};
-    fsMode.Size             = sizeof(D3DDISPLAYMODEEX);
-    fsMode.Width            = m_width;
-    fsMode.Height           = m_height;
-    fsMode.RefreshRate      = m_frameRate;
-    fsMode.Format           = D3DFMT_X8R8G8B8;
-    fsMode.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
-
     hr = m_d3d9->CreateDeviceEx(
         D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, m_hwnd,
         D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED
         | D3DCREATE_FPU_PRESERVE,
-        &pp, &fsMode, &m_device);
+        &pp, nullptr, &m_device);
 
     if (FAILED(hr)) {
         LOG_ERROR("CreateDeviceEx (FSE %ux%u@%uHz) failed: 0x%08X",
