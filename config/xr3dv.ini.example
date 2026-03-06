@@ -31,8 +31,9 @@ Convergence=5.0
 IPD=0.064
 
 [Debug]
-; Log verbosity: 0=Off  1=Errors  2=Verbose
-LogLevel=1
+; Log verbosity: 0=Off  1=Errors  2=Info  3=Verbose  4=Trace (frame-by-frame)
+; Use 4 when diagnosing hangs; set to 1 or 2 for normal use.
+LogLevel=4
 
 ; Log file path.  Relative paths are resolved next to xr3dv.dll.
 LogFile=xr3dv.log

@@ -30,7 +30,7 @@ struct Config {
     float ipd = 0.064f;
 
     // ---- [Debug] ---------------------------------------------------------
-    int         logLevel = 1;    ///< 0=off 1=errors 2=verbose
+    int         logLevel = 4;    ///< 0=off 1=errors 2=info 3=verbose 4=trace
     std::string logFile  = "xr3dv.log";
 
     // ---- Internal --------------------------------------------------------

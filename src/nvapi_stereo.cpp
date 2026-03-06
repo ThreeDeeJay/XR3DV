@@ -175,35 +175,34 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 {
     if (!m_initialised) return false;
 
+    LOG_TRACE("PresentStereoFrame: enter");
+
     // Blit left eye --------------------------------------------------------
+    LOG_TRACE("PresentStereoFrame: blitting left eye...");
     if (!BlitD3D11ToD3D9(leftSRV, d3d11Dev, m_leftSurface.Get(),
                           m_stagingTex, m_sysMemLeft)) return false;
-
-    // Tell NVAPI we're about to write the left eye
+    LOG_TRACE("PresentStereoFrame: left blit done, calling StretchRect...");
     NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_LEFT);
-
-    m_device->StretchRect(
-        m_leftSurface.Get(), nullptr,
-        m_backBuffer.Get(),  nullptr,
-        D3DTEXF_LINEAR);
+    m_device->StretchRect(m_leftSurface.Get(), nullptr, m_backBuffer.Get(), nullptr, D3DTEXF_LINEAR);
+    LOG_TRACE("PresentStereoFrame: left StretchRect done");
 
     // Blit right eye -------------------------------------------------------
+    LOG_TRACE("PresentStereoFrame: blitting right eye...");
     if (!BlitD3D11ToD3D9(rightSRV, d3d11Dev, m_rightSurface.Get(),
                           m_stagingTexRight, m_sysMemRight)) return false;
-
+    LOG_TRACE("PresentStereoFrame: right blit done, calling StretchRect...");
     NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
-
-    m_device->StretchRect(
-        m_rightSurface.Get(), nullptr,
-        m_backBuffer.Get(),   nullptr,
-        D3DTEXF_LINEAR);
+    m_device->StretchRect(m_rightSurface.Get(), nullptr, m_backBuffer.Get(), nullptr, D3DTEXF_LINEAR);
+    LOG_TRACE("PresentStereoFrame: right StretchRect done");
 
     // Present the stereo frame ---------------------------------------------
+    LOG_TRACE("PresentStereoFrame: calling PresentEx...");
     HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
     if (FAILED(hr)) {
         LOG_ERROR("D3D9 PresentEx failed: 0x%08X", hr);
         return false;
     }
+    LOG_TRACE("PresentStereoFrame: PresentEx done hr=0x%08X", (unsigned)hr);
     return true;
 }
 
@@ -281,18 +280,21 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     // ---- Copy D3D11 tex -> staging and block until GPU is done -----------
     ComPtr<ID3D11DeviceContext> ctx;
     d3d11Dev->GetImmediateContext(&ctx);
+    LOG_TRACE("Blit: CopyResource fmt=%u %ux%u", (unsigned)m_stagingFormat, m_stagingWidth, m_stagingHeight);
     ctx->CopyResource(stagingTex.Get(), srcTex.Get());
 
     // Blocking Map: stalls CPU until CopyResource completes (~0.5–2 ms for
     // a 1080p texture on a modern GPU).  DO_NOT_WAIT was wrong here because
     // the staging texture has no fence — the driver must guarantee completion
     // before Map returns, but only with MapFlags=0.
+    LOG_TRACE("Blit: Map (blocking)...");
     D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT hr = ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
         LOG_ERROR("D3D11 Map staging failed: 0x%08X", hr);
         return false;
     }
+    LOG_TRACE("Blit: Map done rowPitch=%u", mapped.RowPitch);
 
     // ---- Copy row-by-row into cached SYSMEM surface ----------------------
     D3DLOCKED_RECT lr{};

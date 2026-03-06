@@ -21,28 +21,27 @@ void LogInit(const std::string& path, LogLevel level) {
     }
 }
 
-void LogWrite(LogLevel level, const char* fmt, ...) {
+void LogWrite(LogLevel level, const char* tag, const char* fmt, ...) {
     if (level > g_logLevel) return;
 
-    char buf[2048];
+    char msg[2048];
     va_list args;
     va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
+    vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    // Timestamp
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char ts[64];
-    snprintf(ts, sizeof(ts), "[%02d:%02d:%02d.%03d] ",
-             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    char buf[2176];
+    snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] [%-7s] %s",
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag, msg);
 
     std::lock_guard<std::mutex> lk(g_logMtx);
     if (g_logFile.is_open()) {
-        g_logFile << ts << buf << '\n';
+        g_logFile << buf << '\n';
         g_logFile.flush();
     }
-    OutputDebugStringA((std::string("XR3DV: ") + ts + buf + "\n").c_str());
+    OutputDebugStringA((std::string("XR3DV: ") + buf + "\n").c_str());
 }
 
 } // namespace xr3dv

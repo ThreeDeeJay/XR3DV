@@ -112,11 +112,15 @@ XrResult Session::RequestExit() {
 // Frame loop
 // ---------------------------------------------------------------------------
 XrResult Session::WaitFrame(const XrFrameWaitInfo* /*info*/, XrFrameState* state) {
-    if (!IsRunning()) return XR_ERROR_SESSION_NOT_RUNNING;
+    LOG_TRACE("WaitFrame: enter (state=%d)", (int)m_state.load());
+    if (!IsRunning()) {
+        LOG_ERROR("WaitFrame: session not running (state=%d)", (int)m_state.load());
+        return XR_ERROR_SESSION_NOT_RUNNING;
+    }
 
-    // Do NOT hold m_frameMtx across the timer sleep — BeginFrame also needs
-    // that mutex and would deadlock waiting for WaitFrame to release it.
+    LOG_TRACE("WaitFrame: calling WaitAndGetNextDisplayTime...");
     int64_t displayTime = m_timer.WaitAndGetNextDisplayTime();
+    LOG_TRACE("WaitFrame: displayTime=%" PRId64, displayTime);
 
     {
         std::lock_guard<std::mutex> lk(m_frameMtx);
@@ -127,27 +131,46 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* /*info*/, XrFrameState* state
     state->predictedDisplayPeriod = static_cast<XrDuration>(1'000'000'000LL / m_cfg.frameRate);
     state->shouldRender           = XR_TRUE;
 
+    LOG_TRACE("WaitFrame: return XR_SUCCESS");
     return XR_SUCCESS;
 }
 
 XrResult Session::BeginFrame(const XrFrameBeginInfo* /*info*/) {
-    if (!IsRunning()) return XR_ERROR_SESSION_NOT_RUNNING;
+    LOG_TRACE("BeginFrame: enter");
+    if (!IsRunning()) {
+        LOG_ERROR("BeginFrame: session not running (state=%d)", (int)m_state.load());
+        return XR_ERROR_SESSION_NOT_RUNNING;
+    }
     std::lock_guard<std::mutex> lk(m_frameMtx);
-    if (m_frameBegun) return XR_ERROR_CALL_ORDER_INVALID;
+    if (m_frameBegun) {
+        LOG_ERROR("BeginFrame: XR_ERROR_CALL_ORDER_INVALID (frame already begun)");
+        return XR_ERROR_CALL_ORDER_INVALID;
+    }
     m_frameBegun = true;
+    LOG_TRACE("BeginFrame: return XR_SUCCESS");
     return XR_SUCCESS;
 }
 
 XrResult Session::EndFrame(const XrFrameEndInfo* info) {
-    if (!IsRunning()) return XR_ERROR_SESSION_NOT_RUNNING;
+    LOG_TRACE("EndFrame: enter layerCount=%u", info ? info->layerCount : 0u);
+    if (!IsRunning()) {
+        LOG_ERROR("EndFrame: session not running");
+        return XR_ERROR_SESSION_NOT_RUNNING;
+    }
 
     {
         std::lock_guard<std::mutex> lk(m_frameMtx);
-        if (!m_frameBegun) return XR_ERROR_CALL_ORDER_INVALID;
+        if (!m_frameBegun) {
+            LOG_ERROR("EndFrame: XR_ERROR_CALL_ORDER_INVALID (BeginFrame not called)");
+            return XR_ERROR_CALL_ORDER_INVALID;
+        }
         m_frameBegun = false;
     }
 
-    if (!info || info->layerCount == 0) return XR_SUCCESS; // shouldRender was false
+    if (!info || info->layerCount == 0) {
+        LOG_TRACE("EndFrame: no layers, skipping present");
+        return XR_SUCCESS;
+    }
 
     // Find left and right projection layer swapchains
     for (uint32_t l = 0; l < info->layerCount; ++l) {
@@ -161,22 +184,30 @@ XrResult Session::EndFrame(const XrFrameEndInfo* info) {
 
         m_leftSwapchain  = proj->views[0].subImage.swapchain;
         m_rightSwapchain = proj->views[1].subImage.swapchain;
+        LOG_TRACE("EndFrame: left SC=0x%p right SC=0x%p",
+                  (void*)m_leftSwapchain, (void*)m_rightSwapchain);
         break;
     }
 
-    PresentFrame(info);
+    LOG_TRACE("EndFrame: calling PresentFrame...");
+    bool ok = PresentFrame(info);
+    LOG_TRACE("EndFrame: PresentFrame returned %s", ok ? "true" : "false");
     return XR_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
 bool Session::PresentFrame(const XrFrameEndInfo* /*info*/) {
+    LOG_TRACE("PresentFrame: enter");
     Swapchain* left  = GetSwapchain(m_leftSwapchain);
     Swapchain* right = GetSwapchain(m_rightSwapchain);
 
     if (!left || !right) {
-        LOG_VERBOSE("EndFrame: missing left/right swapchain handles");
+        LOG_VERBOSE("PresentFrame: missing left/right swapchain handles (left=%p right=%p)",
+                    (void*)m_leftSwapchain, (void*)m_rightSwapchain);
         return false;
     }
+    LOG_TRACE("PresentFrame: left isDepth=%d right isDepth=%d",
+              (int)left->IsDepth(), (int)right->IsDepth());
 
     if (left->IsDepth() || right->IsDepth()) {
         LOG_ERROR("EndFrame: projection view swapchain is a depth format — skipping blit");
@@ -186,12 +217,24 @@ bool Session::PresentFrame(const XrFrameEndInfo* /*info*/) {
     const auto* leftImg  = left->GetLatestImage();
     const auto* rightImg = right->GetLatestImage();
 
-    if (!leftImg || !rightImg) return false;
+    LOG_TRACE("PresentFrame: leftImg=%p rightImg=%p",
+              (const void*)leftImg, (const void*)rightImg);
 
-    return m_stereo->PresentStereoFrame(
+    if (!leftImg || !rightImg) {
+        LOG_VERBOSE("PresentFrame: no acquired image yet (left=%p right=%p) -- skipping",
+                    (const void*)leftImg, (const void*)rightImg);
+        return false;
+    }
+
+    LOG_TRACE("PresentFrame: leftSRV=%p rightSRV=%p",
+              (void*)leftImg->srv.Get(), (void*)rightImg->srv.Get());
+    LOG_TRACE("PresentFrame: calling PresentStereoFrame...");
+    bool ok = m_stereo->PresentStereoFrame(
         leftImg->srv.Get(),
         rightImg->srv.Get(),
         m_d3d11Dev.Get());
+    LOG_TRACE("PresentFrame: PresentStereoFrame returned %s", ok ? "true" : "false");
+    return ok;
 }
 
 // ---------------------------------------------------------------------------

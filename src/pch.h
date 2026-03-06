@@ -40,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cinttypes>
 #include <cstring>
 #include <fstream>
 #include <memory>
