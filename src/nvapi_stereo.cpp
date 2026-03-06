@@ -278,10 +278,27 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     ComPtr<ID3D11DeviceContext> ctx;
     d3d11Dev->GetImmediateContext(&ctx);
     ctx->CopyResource(stagingTex.Get(), srcTex.Get());
+    ctx->Flush(); // ensure CopyResource is submitted before we poll Map
 
+    // Non-blocking Map with retry: avoids stalling the XrEndFrame call if
+    // the GPU hasn't finished yet.  10 ms total budget matches the spin
+    // deadline in WaitFrame so the frame loop stays bounded.
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) { LOG_ERROR("D3D11 Map staging failed: 0x%08X", hr); return false; }
+    HRESULT hr = E_FAIL;
+    const DWORD retryDeadlineMs = GetTickCount() + 10;
+    do {
+        hr = ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ,
+                      D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+            if (GetTickCount() > retryDeadlineMs) break;
+            Sleep(0); // yield to let GPU finish
+        }
+    } while (hr == DXGI_ERROR_WAS_STILL_DRAWING);
+
+    if (FAILED(hr)) {
+        LOG_ERROR("D3D11 Map staging failed: 0x%08X -- skipping frame", hr);
+        return false;
+    }
 
     // ---- Copy row-by-row into cached SYSMEM surface ----------------------
     D3DLOCKED_RECT lr{};
