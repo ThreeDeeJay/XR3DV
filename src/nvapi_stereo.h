@@ -79,6 +79,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTexRight;  // right eye
     uint32_t m_stagingWidth  = 0;
     uint32_t m_stagingHeight = 0;
+    DXGI_FORMAT m_stagingFormat = DXGI_FORMAT_UNKNOWN;
 
     // Cached SYSMEM surfaces for CPU→D3D9 upload (avoids per-frame allocation)
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;
