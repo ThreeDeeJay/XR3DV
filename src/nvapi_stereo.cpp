@@ -37,7 +37,7 @@ static HWND CreatePresentationWindow() {
         0, 0, 1, 1,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    // Window is shown by the caller (MsgThreadProc) with SW_SHOW to activate it.
     return hw;
 }
 
@@ -49,18 +49,33 @@ static HWND CreatePresentationWindow() {
 // m_initOk to signal completion back to Init().
 // ---------------------------------------------------------------------------
 void NvapiStereoPresenter::MsgThreadProc() {
-    // --- Create window ---
+    // --- Create window and ACTIVATE it ---
+    // D3D9 FSE CreateDeviceEx requires the device window to be the active
+    // foreground window at the moment of creation.  SW_SHOW (not SHOWNOACTIVATE)
+    // activates and focuses the window.
     m_hwnd = CreatePresentationWindow();
     if (!m_hwnd) {
-        LOG_ERROR("CreatePresentationWindow failed");
-        m_initOk.store(false);
-        m_initDone.store(true);
-        return;
+        LOG_ERROR("CreatePresentationWindow failed (GLE=%u)", GetLastError());
+        m_initOk.store(false); m_initDone.store(true); return;
     }
-
-    // --- Force foreground focus so CreateDeviceEx accepts FSE ---
+    ShowWindow(m_hwnd, SW_SHOW);          // activate
+    BringWindowToTop(m_hwnd);
     SetForegroundWindow(m_hwnd);
+    SetActiveWindow(m_hwnd);
     SetFocus(m_hwnd);
+    // Let the window settle and reach the foreground before D3D9 init
+    MSG tmpMsg;
+    for (int i = 0; i < 5; ++i) {
+        Sleep(20);
+        while (PeekMessageW(&tmpMsg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&tmpMsg);
+            DispatchMessageW(&tmpMsg);
+        }
+    }
+    LOG_INFO("D3D9 window HWND=%p foreground=%s active=%s",
+             (void*)m_hwnd,
+             GetForegroundWindow() == m_hwnd ? "YES" : "NO",
+             GetActiveWindow()    == m_hwnd ? "YES" : "NO");
 
     // --- Create D3D9Ex ---
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
@@ -69,10 +84,34 @@ void NvapiStereoPresenter::MsgThreadProc() {
         m_initOk.store(false); m_initDone.store(true); return;
     }
 
+    // --- Enumerate adapter modes and find a matching one -----------------
+    // D3DERR_INVALIDCALL is returned if the requested mode doesn't exist.
+    // Log all available modes so we can diagnose mismatches.
+    {
+        UINT modeCount = m_d3d9->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8);
+        LOG_INFO("Adapter modes (X8R8G8B8): %u", modeCount);
+        bool found = false;
+        for (UINT i = 0; i < modeCount; ++i) {
+            D3DDISPLAYMODE mode{};
+            m_d3d9->EnumAdapterModes(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8, i, &mode);
+            bool match = (mode.Width == m_width && mode.Height == m_height
+                          && mode.RefreshRate == m_frameRate);
+            LOG_VERBOSE("  [%u] %ux%u@%uHz%s", i, mode.Width, mode.Height,
+                        mode.RefreshRate, match ? " <-- TARGET" : "");
+            if (match) found = true;
+        }
+        if (!found) {
+            LOG_ERROR("No adapter mode found matching %ux%u@%uHz X8R8G8B8 -- "
+                      "check FrameRate in xr3dv.ini matches your monitor",
+                      m_width, m_height, m_frameRate);
+            // Don't abort -- try anyway; some drivers accept it regardless
+        }
+    }
+
     D3DPRESENT_PARAMETERS pp{};
     pp.BackBufferWidth            = m_width;
     pp.BackBufferHeight           = m_height;
-    pp.BackBufferFormat           = D3DFMT_X8R8G8B8; // X8R8G8B8 is standard FSE format
+    pp.BackBufferFormat           = D3DFMT_X8R8G8B8;
     pp.BackBufferCount            = 2;
     pp.SwapEffect                 = D3DSWAPEFFECT_DISCARD;
     pp.hDeviceWindow              = m_hwnd;
@@ -83,7 +122,8 @@ void NvapiStereoPresenter::MsgThreadProc() {
 
     hr = m_d3d9->CreateDeviceEx(
         D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, m_hwnd,
-        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED
+        | D3DCREATE_FPU_PRESERVE,
         &pp, nullptr, &m_device);
 
     if (FAILED(hr)) {
