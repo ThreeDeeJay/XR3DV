@@ -84,11 +84,14 @@ private:
     // ------ Message pump thread -------------------------------------------
     std::thread       m_msgThread;
     std::atomic<bool> m_msgStop{false};
+    std::atomic<bool> m_initDone{false};  // set by MsgThreadProc when D3D9 init completes
+    std::atomic<bool> m_initOk{false};    // set by MsgThreadProc: true=success false=failure
 
     // ------ State ---------------------------------------------------------
     bool     m_initialised = false;
     uint32_t m_width       = 0;
     uint32_t m_height      = 0;
+    uint32_t m_frameRate   = 120;
 };
 
 bool NvapiIsAvailable();

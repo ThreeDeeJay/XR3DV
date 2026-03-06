@@ -42,10 +42,95 @@ static HWND CreatePresentationWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// Dedicated Win32 message-pump thread
+// Message + D3D9 thread
+// ---------------------------------------------------------------------------
+// ALL D3D9 FSE operations (window creation, device creation, present) MUST
+// happen on the same thread.  We do everything here and use m_initDone /
+// m_initOk to signal completion back to Init().
 // ---------------------------------------------------------------------------
 void NvapiStereoPresenter::MsgThreadProc() {
-    // Messages for m_hwnd must be pumped on the thread that created it.
+    // --- Create window ---
+    m_hwnd = CreatePresentationWindow();
+    if (!m_hwnd) {
+        LOG_ERROR("CreatePresentationWindow failed");
+        m_initOk.store(false);
+        m_initDone.store(true);
+        return;
+    }
+
+    // --- Force foreground focus so CreateDeviceEx accepts FSE ---
+    SetForegroundWindow(m_hwnd);
+    SetFocus(m_hwnd);
+
+    // --- Create D3D9Ex ---
+    HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
+    if (FAILED(hr)) {
+        LOG_ERROR("Direct3DCreate9Ex failed: 0x%08X", hr);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+
+    D3DPRESENT_PARAMETERS pp{};
+    pp.BackBufferWidth            = m_width;
+    pp.BackBufferHeight           = m_height;
+    pp.BackBufferFormat           = D3DFMT_X8R8G8B8; // X8R8G8B8 is standard FSE format
+    pp.BackBufferCount            = 2;
+    pp.SwapEffect                 = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow              = m_hwnd;
+    pp.Windowed                   = FALSE;
+    pp.EnableAutoDepthStencil     = FALSE;
+    pp.FullScreen_RefreshRateInHz = m_frameRate;
+    pp.PresentationInterval       = D3DPRESENT_INTERVAL_ONE;
+
+    hr = m_d3d9->CreateDeviceEx(
+        D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, m_hwnd,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        &pp, nullptr, &m_device);
+
+    if (FAILED(hr)) {
+        LOG_ERROR("CreateDeviceEx (FSE %ux%u@%uHz) failed: 0x%08X",
+                  m_width, m_height, m_frameRate, hr);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+    LOG_INFO("D3D9 FSE device: %ux%u@%uHz", m_width, m_height, m_frameRate);
+
+    // --- NVAPI stereo handle ---
+    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
+    if (nvs != NVAPI_OK) {
+        LOG_ERROR("NvAPI_Stereo_CreateHandleFromIUnknown failed (%d)", nvs);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+    nvs = NvAPI_Stereo_Activate(m_stereoHandle);
+    if (nvs != NVAPI_OK) {
+        LOG_ERROR("NvAPI_Stereo_Activate failed (%d)", nvs);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+
+    // --- Per-eye offscreen surfaces ---
+    hr = m_device->CreateOffscreenPlainSurface(
+        m_width, m_height, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
+        &m_leftSurface, nullptr);
+    if (FAILED(hr)) {
+        LOG_ERROR("CreateOffscreenPlainSurface (left) failed: 0x%08X", hr);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+    hr = m_device->CreateOffscreenPlainSurface(
+        m_width, m_height, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
+        &m_rightSurface, nullptr);
+    if (FAILED(hr)) {
+        LOG_ERROR("CreateOffscreenPlainSurface (right) failed: 0x%08X", hr);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+    hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBuffer);
+    if (FAILED(hr)) {
+        LOG_ERROR("GetBackBuffer failed: 0x%08X", hr);
+        m_initOk.store(false); m_initDone.store(true); return;
+    }
+
+    // Signal Init() that D3D9 setup succeeded
+    m_initOk.store(true);
+    m_initDone.store(true);
+
+    // --- Message pump ---
     while (!m_msgStop.load(std::memory_order_relaxed)) {
         MSG msg;
         if (MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT,
@@ -66,10 +151,11 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
                                  uint32_t frameRate,
                                  float separation, float convergence)
 {
-    m_width  = width;
-    m_height = height;
+    m_width     = width;
+    m_height    = height;
+    m_frameRate = frameRate;
 
-    // ------ 1. Initialise NVAPI ------------------------------------------
+    // ------ 1. Initialise NVAPI on calling thread ------------------------
     NvAPI_Status nvs = NvAPI_Initialize();
     if (nvs != NVAPI_OK) {
         NvAPI_ShortString errStr;
@@ -77,8 +163,6 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
         LOG_ERROR("NvAPI_Initialize failed: %s", errStr);
         return false;
     }
-
-    // ------ 2. Enable stereo globally ------------------------------------
     nvs = NvAPI_Stereo_Enable();
     if (nvs != NVAPI_OK) {
         LOG_ERROR("NvAPI_Stereo_Enable failed (%d). "
@@ -86,34 +170,30 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
         return false;
     }
 
-    // ------ 3. Create window on the message thread -----------------------
-    // Win32 requires messages to be pumped on the thread that created the
-    // window.  Spawn the thread, let it create the window, then wait.
-    m_msgStop = false;
-    m_msgThread = std::thread([this, width, height, frameRate]() {
-        m_hwnd = CreatePresentationWindow();
-        if (m_hwnd) MsgThreadProc();
-    });
+    // ------ 2. Spin up message thread to create window + D3D9 device -----
+    // D3D9 FSE requires CreateDeviceEx to be called on the thread that owns
+    // the window, so ALL D3D9 init happens inside MsgThreadProc().
+    m_msgStop  = false;
+    m_initDone = false;
+    m_initOk   = false;
+    m_msgThread = std::thread([this]() { MsgThreadProc(); });
 
-    for (int i = 0; i < 200 && !m_hwnd; ++i) Sleep(10);
-    if (!m_hwnd) {
-        LOG_ERROR("Timed out waiting for D3D9 presentation window");
+    // Wait up to 5 s for D3D9 init to complete
+    for (int i = 0; i < 500 && !m_initDone.load(); ++i) Sleep(10);
+    if (!m_initDone.load()) {
+        LOG_ERROR("Timed out waiting for D3D9 initialisation");
         m_msgStop = true;
         if (m_msgThread.joinable()) m_msgThread.join();
         return false;
     }
-    LOG_INFO("D3D9 presentation window HWND=%p", (void*)m_hwnd);
+    if (!m_initOk.load()) {
+        LOG_ERROR("D3D9 initialisation failed (see above)");
+        m_msgStop = true;
+        if (m_msgThread.joinable()) m_msgThread.join();
+        return false;
+    }
 
-    // ------ 4. Create FSE D3D9Ex device ----------------------------------
-    if (!CreateD3D9Device(width, height, frameRate)) return false;
-
-    // ------ 5. Create NVAPI stereo handle --------------------------------
-    if (!EnableNvStereo()) return false;
-
-    // ------ 6. Create per-eye offscreen surfaces -------------------------
-    if (!CreateStagingResources(width, height)) return false;
-
-    // ------ 7. Apply initial parameters ----------------------------------
+    // ------ 3. Apply initial stereo parameters ---------------------------
     SetSeparation(separation);
     SetConvergence(convergence);
 
@@ -124,76 +204,11 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
 }
 
 // ---------------------------------------------------------------------------
-bool NvapiStereoPresenter::CreateD3D9Device(uint32_t width, uint32_t height,
-                                             uint32_t frameRate) {
-    HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
-    if (FAILED(hr)) { LOG_ERROR("Direct3DCreate9Ex failed: 0x%08X", hr); return false; }
-
-    D3DPRESENT_PARAMETERS pp{};
-    pp.BackBufferWidth            = width;
-    pp.BackBufferHeight           = height;
-    pp.BackBufferFormat           = D3DFMT_A8R8G8B8;
-    pp.BackBufferCount            = 2;
-    pp.SwapEffect                 = D3DSWAPEFFECT_DISCARD;
-    pp.hDeviceWindow              = m_hwnd;
-    pp.Windowed                   = FALSE;           // FULLSCREEN EXCLUSIVE
-    pp.EnableAutoDepthStencil     = FALSE;
-    pp.FullScreen_RefreshRateInHz = frameRate;       // must be 120 for 3D Vision
-    // INTERVAL_ONE works correctly in FSE since DWM is bypassed entirely.
-    pp.PresentationInterval       = D3DPRESENT_INTERVAL_ONE;
-
-    hr = m_d3d9->CreateDeviceEx(
-        D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, m_hwnd,
-        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
-        &pp, nullptr, &m_device);
-
-    if (FAILED(hr)) {
-        LOG_ERROR("CreateDeviceEx (FSE %ux%u@%uHz) failed: 0x%08X "
-                  "-- confirm monitor supports this mode and 3D Vision is on",
-                  width, height, frameRate, hr);
-        return false;
-    }
-    LOG_INFO("D3D9 FSE device: %ux%u@%uHz", width, height, frameRate);
-    return true;
-}
-
+// Stubs kept for link compatibility (all logic moved into MsgThreadProc)
 // ---------------------------------------------------------------------------
-bool NvapiStereoPresenter::EnableNvStereo() {
-    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
-    if (nvs != NVAPI_OK) {
-        LOG_ERROR("NvAPI_Stereo_CreateHandleFromIUnknown failed (%d)", nvs);
-        return false;
-    }
-    // Activate stereo
-    nvs = NvAPI_Stereo_Activate(m_stereoHandle);
-    if (nvs != NVAPI_OK) {
-        LOG_ERROR("NvAPI_Stereo_Activate failed (%d)", nvs);
-        return false;
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-bool NvapiStereoPresenter::CreateStagingResources(uint32_t width, uint32_t height) {
-    HRESULT hr;
-
-    // Offscreen plain surfaces for each eye (D3DPOOL_DEFAULT)
-    hr = m_device->CreateOffscreenPlainSurface(
-        width, height, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
-        &m_leftSurface, nullptr);
-    if (FAILED(hr)) { LOG_ERROR("CreateOffscreenPlainSurface (left) failed: 0x%08X", hr); return false; }
-
-    hr = m_device->CreateOffscreenPlainSurface(
-        width, height, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
-        &m_rightSurface, nullptr);
-    if (FAILED(hr)) { LOG_ERROR("CreateOffscreenPlainSurface (right) failed: 0x%08X", hr); return false; }
-
-    // Back buffer reference for StretchRect
-    hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBuffer);
-    if (FAILED(hr)) { LOG_ERROR("GetBackBuffer failed: 0x%08X", hr); return false; }
-
-    return true;
-}
+bool NvapiStereoPresenter::CreateD3D9Device(uint32_t, uint32_t, uint32_t) { return true; }
+bool NvapiStereoPresenter::EnableNvStereo()                                { return true; }
+bool NvapiStereoPresenter::CreateStagingResources(uint32_t, uint32_t)     { return true; }
 
 // ---------------------------------------------------------------------------
 // PresentStereoFrame
@@ -299,7 +314,7 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     if (!sysMemSurf) {
         HRESULT hrd = m_device->CreateOffscreenPlainSurface(
             m_stagingWidth, m_stagingHeight,
-            D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+            D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM,
             &sysMemSurf, nullptr);
         if (FAILED(hrd)) {
             LOG_ERROR("CreateOffscreenPlainSurface (sysmem) failed: 0x%08X", hrd);
