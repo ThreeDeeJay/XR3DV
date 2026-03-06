@@ -216,7 +216,6 @@ bool NvapiStereoPresenter::PresentStereoFrame(
         DispatchMessageW(&msg);
     }
     HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-    HRESULT hr = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
     if (FAILED(hr)) {
         LOG_ERROR("D3D9 PresentEx failed: 0x%08X", hr);
         return false;
