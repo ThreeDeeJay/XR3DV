@@ -20,8 +20,12 @@ bool RuntimeInit(Runtime** out) {
 
     auto* rt = new Runtime();
 
-    // Load config
+    // Load config — set game ini path first so it overlays sep/conv at startup
     std::string iniPath = GetDefaultIniPath();
+    std::string gameIniPath = GetGameIniPath();
+    // Only use game ini if it's a different directory than the global ini
+    if (gameIniPath != iniPath)
+        rt->cfg.gameIniPath = gameIniPath;
     LoadConfig(rt->cfg, iniPath);
 
     // Initialise logging

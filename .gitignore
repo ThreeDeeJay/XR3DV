@@ -13,3 +13,4 @@ include/nvapi/
 *.log
 xr3dv.ini
 /Release
+LICENSE

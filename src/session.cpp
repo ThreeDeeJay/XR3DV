@@ -44,9 +44,10 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
     // Initialise NVAPI stereo presenter
     m_stereo = std::make_unique<NvapiStereoPresenter>();
     if (!m_stereo->Init(m_cfg.width, m_cfg.height,
-                        m_cfg.frameRate,
+                        m_cfg.monitorRate,          // FSE rate = full monitor Hz
                         m_cfg.separation.load(),
-                        m_cfg.convergence.load()))
+                        m_cfg.convergence.load(),
+                        m_cfg.gameIniPath))
     {
         LOG_ERROR("Failed to initialise NVAPI stereo presenter");
         return XR_ERROR_INITIALIZATION_FAILED;
@@ -66,9 +67,9 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
 void Session::PollConfigThread() {
     while (!m_pollStop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        PollConfigReload(m_cfg);
+        bool changed = PollConfigReload(m_cfg);
 
-        if (m_stereo && m_stereo->IsInitialised()) {
+        if (changed && m_stereo && m_stereo->IsInitialised()) {
             m_stereo->SetSeparation(m_cfg.separation.load());
             m_stereo->SetConvergence(m_cfg.convergence.load());
         }

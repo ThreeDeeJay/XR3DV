@@ -1,39 +1,33 @@
-; XR3DV Configuration File
-; ========================
-; Place this file next to xr3dv.dll as "xr3dv.ini"
-; Changes to [Stereo] Separation and Convergence are hot-reloaded
-; without restarting the application (polled every 500ms).
+; XR3DV runtime configuration
+; Place this file next to xr3dv.dll  OR  next to your game's .exe
+; (Game-local copy overrides only [Stereo] separation and convergence)
 
 [Display]
-; Per-eye render resolution in pixels.
-; Larger values improve sharpness but increase GPU load.
+; Per-eye render resolution
 Width=1920
 Height=1080
 
-; Target display refresh rate in Hz.
-; Should match your monitor and 3D Vision emitter frequency.
-; Common values: 60, 100, 120 (3D Vision requires 120 Hz in stereo mode)
-FrameRate=120
+; Physical monitor refresh rate in Hz (used for D3D9 FSE device)
+; Must match a mode listed in the xr3dv.log adapter mode list
+MonitorRate=120
+
+; Set HalfRate=true for shutter 3D displays (e.g. 120 Hz monitor, 60 fps per eye)
+; XR apps will be timed at MonitorRate/2; D3D9 still runs at MonitorRate
+HalfRate=false
 
 [Stereo]
-; Eye separation as a percentage [0.0 – 100.0].
-; Higher values push objects further apart (stronger 3D depth effect).
-; Start around 30–60 and adjust for comfort.
+; Eye separation [0-100%]  — Ctrl+F3 decrease / Ctrl+F4 increase
 Separation=50.0
 
-; Convergence / zero-parallax point [0.0 – 25.0].
-; Controls where the stereo "screen plane" sits.
-; Lower = objects feel closer; higher = more depth behind the screen.
-Convergence=5.0
+; Convergence [0-25]       — Ctrl+F5 decrease / Ctrl+F6 increase
+Convergence=5.000
 
-; Interpupillary distance in metres [0.04 – 0.10].
-; The physical distance between your eyes.  Average adult: 0.064.
+; Save current values      — Ctrl+F7 (writes to game-local xr3dv.ini)
+
+; Interpupillary distance in metres
 IPD=0.064
 
 [Debug]
-; Log verbosity: 0=Off  1=Errors  2=Info  3=Verbose  4=Trace (frame-by-frame)
-; Use 4 when diagnosing hangs; set to 1 or 2 for normal use.
-LogLevel=4
-
-; Log file path.  Relative paths are resolved next to xr3dv.dll.
+; Log verbosity: 0=off 1=errors 2=info 3=verbose 4=trace
+LogLevel=1
 LogFile=xr3dv.log
