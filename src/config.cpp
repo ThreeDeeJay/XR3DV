@@ -111,7 +111,7 @@ bool LoadConfig(Config& cfg, const std::string& iniPath) {
     cfg.height      = getUint(ini, "display", "height",      cfg.height);
     cfg.monitorRate = getUint(ini, "display", "monitorrate", cfg.monitorRate);
 
-    bool halfRate = getBool(ini, "display", "halfrate", false);
+    bool halfRate = getBool(ini, "display", "halfrate", true); // default ON for shutter displays
     cfg.frameRate = halfRate ? cfg.monitorRate / 2 : cfg.monitorRate;
 
     cfg.separation  = getFloat(ini, "stereo", "separation",  cfg.separation.load());

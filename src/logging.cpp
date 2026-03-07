@@ -30,11 +30,8 @@ void LogWrite(LogLevel level, const char* tag, const char* fmt, ...) {
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    SYSTEMTIME st;
-    GetLocalTime(&st);
     char buf[2176];
-    snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] [%-7s] %s",
-             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag, msg);
+    snprintf(buf, sizeof(buf), "[%-7s] %s", tag, msg);
 
     std::lock_guard<std::mutex> lk(g_logMtx);
     if (g_logFile.is_open()) {

@@ -20,10 +20,10 @@ struct Config {
     /// Actual monitor refresh rate (Hz).  Used for D3D9 FSE device creation.
     uint32_t monitorRate = 120;
 
-    /// Frame rate exposed to xrWaitFrame.  Equals monitorRate normally.
-    /// When HalfRate=true in the INI this is monitorRate/2 (e.g. 60 Hz for
-    /// a 120 Hz shutter display that alternates 60 frames per eye).
-    uint32_t frameRate   = 120;
+    /// Frame rate exposed to xrWaitFrame.
+    /// When HalfRate=true (default): monitorRate/2  (60 fps for a 120 Hz shutter display).
+    /// When HalfRate=false: same as monitorRate.
+    uint32_t frameRate   = 60;
 
     // ---- [Stereo] --------------------------------------------------------
     /// Eye separation as a percentage [0, 100].

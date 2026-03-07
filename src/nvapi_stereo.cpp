@@ -3,7 +3,7 @@
 //  SPDX-License-Identifier: GPL-3.0-or-later
 //
 //  NVAPI stereo bridge: creates a fullscreen-exclusive D3D9Ex device,
-//  enables NVAPI stereo mode, and blits D3D11 left/right eye textures.
+//  enables NVAPI stereo, and blits D3D11 left/right eye textures each frame.
 //  FSE is required for 3D Vision on drivers >= 426.06.
 
 #include "pch.h"
@@ -20,45 +20,111 @@ using Microsoft::WRL::ComPtr;
 namespace xr3dv {
 
 // ---------------------------------------------------------------------------
-// Window for FSE D3D9 presentation
+// Find the game's main window (largest visible top-level window in our
+// process that isn't the XR3DV D3D9 window).
+// ---------------------------------------------------------------------------
+struct FindGameWndCtx { DWORD pid; HWND result; HWND exclude; LONG bestArea; };
+
+static BOOL CALLBACK FindGameWndProc(HWND hw, LPARAM lp) {
+    auto* ctx = reinterpret_cast<FindGameWndCtx*>(lp);
+    if (hw == ctx->exclude) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hw, &pid);
+    if (pid != ctx->pid) return TRUE;
+    if (!IsWindowVisible(hw)) return TRUE;
+    RECT r{};
+    GetWindowRect(hw, &r);
+    LONG area = (r.right - r.left) * (r.bottom - r.top);
+    if (area > ctx->bestArea) {
+        ctx->bestArea = area;
+        ctx->result   = hw;
+    }
+    return TRUE;
+}
+
+static HWND FindGameWindow(HWND excludeHwnd) {
+    FindGameWndCtx ctx{ GetCurrentProcessId(), nullptr, excludeHwnd, 0 };
+    EnumWindows(FindGameWndProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.result;
+}
+
+// ---------------------------------------------------------------------------
+// Custom window procedure — forwards mouse/keyboard to game window so clicks
+// pass through the FSE overlay to the game's UI.
+// ---------------------------------------------------------------------------
+struct WndProcCtx { HWND gameHwnd; };
+static WndProcCtx g_wpCtx{};
+
+static LRESULT CALLBACK XR3DVWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    HWND gh = g_wpCtx.gameHwnd;
+    switch (msg) {
+    // Forward all mouse input to the game window
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP:   case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP:   case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP:   case WM_MBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:  case WM_MOUSEHWHEEL:
+        if (gh) PostMessageW(gh, msg, wp, lp);
+        return 0;
+
+    // Forward keyboard input
+    case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+    case WM_CHAR:    case WM_SYSCHAR:
+        if (gh) PostMessageW(gh, msg, wp, lp);
+        return 0;
+
+    // Don't let our window actually activate (steal focus) via clicks
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    }
+    return DefWindowProcW(hw, msg, wp, lp);
+}
+
+// ---------------------------------------------------------------------------
+// Create presentation window
 // ---------------------------------------------------------------------------
 static HWND CreatePresentationWindow() {
     static const wchar_t kClass[] = L"XR3DV_D3D9";
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = DefWindowProcW;
+    wc.lpfnWndProc   = XR3DVWndProc;   // custom proc for input forwarding
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.lpszClassName = kClass;
+    wc.style         = CS_NOCLOSE;
     RegisterClassExW(&wc);
 
     HWND hw = CreateWindowExW(
-        0, kClass, L"XR3DV", WS_POPUP,
+        WS_EX_NOACTIVATE,   // don't steal activation on creation
+        kClass, L"XR3DV", WS_POPUP,
         0, 0, 1, 1,
         nullptr, nullptr, wc.hInstance, nullptr);
-    // Caller is responsible for showing/activating
     return hw;
 }
 
 // ---------------------------------------------------------------------------
-// Message + D3D9 thread — ALL D3D9 FSE work happens here
+// Message + D3D9 thread — ALL D3D9 FSE work AND message pump live here.
 // ---------------------------------------------------------------------------
 void NvapiStereoPresenter::MsgThreadProc() {
-    // --- Save the current foreground window so we can restore focus later --
-    m_savedFgWnd = GetForegroundWindow();
+    // ---- Save the game's foreground window before we steal it ----
+    m_gameHwnd = GetForegroundWindow();
 
-    // --- Create and ACTIVATE the window ---
+    // ---- Create window, then activate it for FSE ----
     m_hwnd = CreatePresentationWindow();
     if (!m_hwnd) {
         LOG_ERROR("CreatePresentationWindow failed (GLE=%u)", GetLastError());
         m_initOk.store(false); m_initDone.store(true); return;
     }
+
+    // Install global context for the WndProc
+    g_wpCtx.gameHwnd = m_gameHwnd;
+
     ShowWindow(m_hwnd, SW_SHOW);
     BringWindowToTop(m_hwnd);
     SetForegroundWindow(m_hwnd);
     SetActiveWindow(m_hwnd);
     SetFocus(m_hwnd);
 
-    // Pump messages briefly to let the window reach foreground
+    // Brief pump to let window reach foreground before D3D9 init
     MSG tmp;
     for (int i = 0; i < 5; ++i) {
         Sleep(20);
@@ -71,14 +137,14 @@ void NvapiStereoPresenter::MsgThreadProc() {
              GetForegroundWindow() == m_hwnd ? "YES" : "NO",
              GetActiveWindow()     == m_hwnd ? "YES" : "NO");
 
-    // --- Create D3D9Ex ---
+    // ---- Create D3D9Ex ----
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
     if (FAILED(hr)) {
         LOG_ERROR("Direct3DCreate9Ex failed: 0x%08X", hr);
         m_initOk.store(false); m_initDone.store(true); return;
     }
 
-    // --- Enumerate adapter modes (log + verify target mode exists) ---
+    // ---- Enumerate adapter modes ----
     {
         UINT cnt = m_d3d9->GetAdapterModeCount(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8);
         LOG_INFO("Adapter modes (X8R8G8B8): %u", cnt);
@@ -86,18 +152,17 @@ void NvapiStereoPresenter::MsgThreadProc() {
         for (UINT i = 0; i < cnt; ++i) {
             D3DDISPLAYMODE m{};
             m_d3d9->EnumAdapterModes(D3DADAPTER_DEFAULT, D3DFMT_X8R8G8B8, i, &m);
-            bool match = (m.Width == m_width && m.Height == m_height
-                          && m.RefreshRate == m_fseRate);
+            bool match = (m.Width == m_width && m.Height == m_height && m.RefreshRate == m_fseRate);
             LOG_VERBOSE("  [%u] %ux%u@%uHz%s", i, m.Width, m.Height, m.RefreshRate,
                         match ? " <-- TARGET" : "");
             if (match) found = true;
         }
         if (!found)
-            LOG_ERROR("No adapter mode matching %ux%u@%uHz -- check MonitorRate in xr3dv.ini",
+            LOG_ERROR("No adapter mode matching %ux%u@%uHz -- check MonitorRate= in xr3dv.ini",
                       m_width, m_height, m_fseRate);
     }
 
-    // --- Create FSE device ---
+    // ---- Create FSE device ----
     D3DPRESENT_PARAMETERS pp{};
     pp.BackBufferWidth            = m_width;
     pp.BackBufferHeight           = m_height;
@@ -120,8 +185,7 @@ void NvapiStereoPresenter::MsgThreadProc() {
 
     hr = m_d3d9->CreateDeviceEx(
         D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, m_hwnd,
-        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED
-        | D3DCREATE_FPU_PRESERVE,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED | D3DCREATE_FPU_PRESERVE,
         &pp, &fsMode, &m_device);
 
     if (FAILED(hr)) {
@@ -131,9 +195,8 @@ void NvapiStereoPresenter::MsgThreadProc() {
     }
     LOG_INFO("D3D9 FSE device: %ux%u@%uHz", m_width, m_height, m_fseRate);
 
-    // --- NVAPI stereo handle + activate ---
-    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(
-        m_device.Get(), &m_stereoHandle);
+    // ---- NVAPI stereo handle + activate ----
+    NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
     if (nvs != NVAPI_OK) {
         LOG_ERROR("NvAPI_Stereo_CreateHandleFromIUnknown failed (%d)", nvs);
         m_initOk.store(false); m_initDone.store(true); return;
@@ -144,80 +207,61 @@ void NvapiStereoPresenter::MsgThreadProc() {
         m_initOk.store(false); m_initDone.store(true); return;
     }
     {
-        NvU8 activated = 0;
-        NvAPI_Stereo_IsActivated(m_stereoHandle, &activated);
-        LOG_INFO("NVAPI stereo activated: %s", activated ? "YES" : "NO (check Control Panel)");
+        NvU8 active = 0;
+        NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
+        LOG_INFO("NVAPI stereo activated: %s", active ? "YES" : "NO -- check NVIDIA Control Panel");
     }
 
-    // --- Force-stereo surface creation mode so offscreen surfaces get
-    //     proper left/right planes recognised by the driver --------------------
-    NvAPI_Stereo_SetSurfaceCreationMode(
-        m_stereoHandle, NVAPI_STEREO_SURFACECREATEMODE_FORCESTEREO);
-
-    // --- Per-eye offscreen surfaces (DEFAULT pool) ---
+    // ---- Per-eye offscreen surfaces (plain mono DEFAULT pool surfaces) ----
+    // Source surfaces for StretchRect are just normal mono surfaces.
+    // SetActiveEye routes writes to the mono backbuffer → appropriate stereo plane.
     hr = m_device->CreateOffscreenPlainSurface(
-        m_width, m_height, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
-        &m_leftSurface, nullptr);
+        m_width, m_height, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &m_leftSurface, nullptr);
     if (FAILED(hr)) {
-        LOG_ERROR("CreateOffscreenPlainSurface (left) failed: 0x%08X", hr);
+        LOG_ERROR("CreateOffscreenPlainSurface (left) failed: 0x%08X", hr); 
         m_initOk.store(false); m_initDone.store(true); return;
     }
     hr = m_device->CreateOffscreenPlainSurface(
-        m_width, m_height, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
-        &m_rightSurface, nullptr);
+        m_width, m_height, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &m_rightSurface, nullptr);
     if (FAILED(hr)) {
         LOG_ERROR("CreateOffscreenPlainSurface (right) failed: 0x%08X", hr);
         m_initOk.store(false); m_initDone.store(true); return;
     }
 
-    // Reset surface creation mode to normal for everything else
-    NvAPI_Stereo_SetSurfaceCreationMode(
-        m_stereoHandle, NVAPI_STEREO_SURFACECREATEMODE_AUTO);
-
-    // --- Get explicit left/right back buffers ---
-    // When NVAPI stereo is active the device has separate left/right back
-    // buffer planes.  We StretchRect directly to each rather than relying
-    // on SetActiveEye to redirect writes to a mono back buffer reference.
-    hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_LEFT,  &m_backBufferLeft);
+    // ---- Get mono back buffer — SetActiveEye redirects StretchRect to the correct plane ----
+    hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBuffer);
     if (FAILED(hr)) {
-        // Fallback: stereo not truly active, use mono back buffer for both
-        LOG_ERROR("GetBackBuffer(LEFT) failed 0x%08X -- stereo may not be active", hr);
-        m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBufferLeft);
-        m_backBufferRight = m_backBufferLeft;
-    } else {
-        hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_RIGHT, &m_backBufferRight);
-        if (FAILED(hr)) {
-            LOG_ERROR("GetBackBuffer(RIGHT) failed 0x%08X", hr);
-            m_backBufferRight = m_backBufferLeft;
-        } else {
-            LOG_INFO("Stereo back buffers acquired (left=%p right=%p)",
-                     (void*)m_backBufferLeft.Get(), (void*)m_backBufferRight.Get());
-        }
+        LOG_ERROR("GetBackBuffer failed: 0x%08X", hr);
+        m_initOk.store(false); m_initDone.store(true); return;
     }
 
-    // --- Restore focus to the game window ---
-    // Taking FSE focus sends WM_ACTIVATE(INACTIVE) to the game, which can
-    // pause audio.  Post fake focus-restore messages back to it.
-    if (m_savedFgWnd && m_savedFgWnd != m_hwnd) {
-        PostMessageW(m_savedFgWnd, WM_ACTIVATE,
-                     MAKEWPARAM(WA_ACTIVE, 0), (LPARAM)m_hwnd);
-        PostMessageW(m_savedFgWnd, WM_SETFOCUS, (WPARAM)m_hwnd, 0);
-        LOG_INFO("Focus restore messages sent to game window %p", (void*)m_savedFgWnd);
+    // ---- Now find the game's actual main window (which may differ after FSE took over) ----
+    HWND gameWnd = FindGameWindow(m_hwnd);
+    if (gameWnd) {
+        m_gameHwnd       = gameWnd;
+        g_wpCtx.gameHwnd = gameWnd;
+        LOG_INFO("Game main window: %p", (void*)gameWnd);
     }
 
-    // --- Register hotkeys ---
-    RegisterHotKey(nullptr, HK_SEP_DEC,  MOD_CONTROL | MOD_NOREPEAT, VK_F3);
-    RegisterHotKey(nullptr, HK_SEP_INC,  MOD_CONTROL | MOD_NOREPEAT, VK_F4);
-    RegisterHotKey(nullptr, HK_CONV_DEC, MOD_CONTROL | MOD_NOREPEAT, VK_F5);
-    RegisterHotKey(nullptr, HK_CONV_INC, MOD_CONTROL | MOD_NOREPEAT, VK_F6);
-    RegisterHotKey(nullptr, HK_SAVE,     MOD_CONTROL | MOD_NOREPEAT, VK_F7);
-    LOG_INFO("Hotkeys registered: Ctrl+F3/F4=sep Ctrl+F5/F6=conv Ctrl+F7=save");
+    // ---- Restore audio: post fake activate/focus to game window ----
+    if (m_gameHwnd) {
+        PostMessageW(m_gameHwnd, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, 0), (LPARAM)m_hwnd);
+        PostMessageW(m_gameHwnd, WM_SETFOCUS, (WPARAM)m_hwnd, 0);
+    }
+
+    // ---- Start timers ----
+    // TIMER_INPUT_POLL  — 50 ms for hotkey-hold detection via GetAsyncKeyState
+    // TIMER_AUDIO_KEEP  — 2000 ms to keep game audio alive while we have FSE
+    // TIMER_STEREO_SYNC — 500 ms to sync sep/conv with 3DV OSD (bidirectional)
+    SetTimer(nullptr, TIMER_INPUT_POLL,  50,   nullptr);
+    SetTimer(nullptr, TIMER_AUDIO_KEEP,  2000, nullptr);
+    SetTimer(nullptr, TIMER_STEREO_SYNC, 500,  nullptr);
 
     // Signal Init() that setup is complete
     m_initOk.store(true);
     m_initDone.store(true);
 
-    // --- Message pump ---
+    // ---- Message pump ----
     while (!m_msgStop.load(std::memory_order_relaxed)) {
         MSG msg;
         if (MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT,
@@ -225,29 +269,62 @@ void NvapiStereoPresenter::MsgThreadProc() {
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT) { m_msgStop = true; goto done; }
 
-                if (msg.message == WM_HOTKEY) {
-                    float sep  = m_separation;
-                    float conv = m_convergence;
-                    switch (msg.wParam) {
-                    case HK_SEP_DEC:
-                        sep = std::max(0.0f,   sep  - kSepStep);
-                        SetSeparation(sep);
-                        break;
-                    case HK_SEP_INC:
-                        sep = std::min(100.0f, sep  + kSepStep);
-                        SetSeparation(sep);
-                        break;
-                    case HK_CONV_DEC:
-                        conv = std::max(0.0f,  conv - kConvStep);
-                        SetConvergence(conv);
-                        break;
-                    case HK_CONV_INC:
-                        conv = std::min(25.0f, conv + kConvStep);
-                        SetConvergence(conv);
-                        break;
-                    case HK_SAVE:
-                        SaveGameStereoSettings(m_gameIniPath, m_separation, m_convergence);
-                        break;
+                if (msg.message == WM_TIMER) {
+                    if (msg.wParam == TIMER_INPUT_POLL) {
+                        // --- Hotkey-hold polling ---
+                        // All keys are checked every 50 ms so holding adjusts continuously.
+                        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                        if (ctrl) {
+                            float sep  = m_separation;
+                            float conv = m_convergence;
+                            bool changed = false;
+                            if (GetAsyncKeyState(VK_F3) & 0x8000) {
+                                sep = std::max(0.0f,   sep  - kSepStep);  changed = true;
+                            } else if (GetAsyncKeyState(VK_F4) & 0x8000) {
+                                sep = std::min(100.0f, sep  + kSepStep);  changed = true;
+                            }
+                            if (GetAsyncKeyState(VK_F5) & 0x8000) {
+                                conv = std::max(0.0f,  conv - kConvStep); changed = true;
+                            } else if (GetAsyncKeyState(VK_F6) & 0x8000) {
+                                conv = std::min(25.0f, conv + kConvStep); changed = true;
+                            }
+                            if (GetAsyncKeyState(VK_F7) & 0x8000) {
+                                SaveGameStereoSettings(m_gameIniPath, m_separation, m_convergence);
+                            }
+                            if (changed) {
+                                SetSeparation(sep);
+                                SetConvergence(conv);
+                            }
+                        }
+                    }
+                    else if (msg.wParam == TIMER_AUDIO_KEEP) {
+                        // Keep game audio alive while we hold FSE.
+                        // Many engines silence audio when WM_ACTIVATE(INACTIVE) is received.
+                        // Periodically re-send WA_ACTIVE to counteract this.
+                        if (m_gameHwnd) {
+                            PostMessageW(m_gameHwnd, WM_ACTIVATE,
+                                         MAKEWPARAM(WA_ACTIVE, 0), (LPARAM)m_hwnd);
+                        }
+                    }
+                    else if (msg.wParam == TIMER_STEREO_SYNC) {
+                        // Bidirectionally sync sep/conv with the 3DV driver.
+                        // This means: if the user adjusts via the 3DV hardware hotkeys
+                        // (or the 3DV emitter buttons), our values track the OSD values.
+                        if (m_stereoHandle) {
+                            float drvSep = 0.0f, drvConv = 0.0f;
+                            NvAPI_Stereo_GetSeparation(m_stereoHandle, &drvSep);
+                            NvAPI_Stereo_GetConvergence(m_stereoHandle, &drvConv);
+                            // Only update if the driver value differs noticeably
+                            // (driver is authoritative — user may have used 3DV hotkeys)
+                            if (fabsf(drvSep  - m_separation)  > 0.05f) {
+                                m_separation  = drvSep;
+                                LOG_INFO("Separation synced from 3DV OSD: %.1f%%", m_separation);
+                            }
+                            if (fabsf(drvConv - m_convergence) > 0.005f) {
+                                m_convergence = drvConv;
+                                LOG_INFO("Convergence synced from 3DV OSD: %.3f", m_convergence);
+                            }
+                        }
                     }
                 }
 
@@ -257,11 +334,9 @@ void NvapiStereoPresenter::MsgThreadProc() {
         }
     }
 done:
-    UnregisterHotKey(nullptr, HK_SEP_DEC);
-    UnregisterHotKey(nullptr, HK_SEP_INC);
-    UnregisterHotKey(nullptr, HK_CONV_DEC);
-    UnregisterHotKey(nullptr, HK_CONV_INC);
-    UnregisterHotKey(nullptr, HK_SAVE);
+    KillTimer(nullptr, TIMER_INPUT_POLL);
+    KillTimer(nullptr, TIMER_AUDIO_KEEP);
+    KillTimer(nullptr, TIMER_STEREO_SYNC);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,14 +347,14 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
                                  float separation, float convergence,
                                  const std::string& gameIniPath)
 {
-    m_width        = width;
-    m_height       = height;
-    m_fseRate      = fseRate;
-    m_separation   = separation;
-    m_convergence  = convergence;
-    m_gameIniPath  = gameIniPath;
+    m_width       = width;
+    m_height      = height;
+    m_fseRate     = fseRate;
+    m_separation  = separation;
+    m_convergence = convergence;
+    m_gameIniPath = gameIniPath;
 
-    // ------ 1. Initialise NVAPI on calling thread -------------------------
+    // 1. Initialise NVAPI on calling thread
     NvAPI_Status nvs = NvAPI_Initialize();
     if (nvs != NVAPI_OK) {
         NvAPI_ShortString errStr;
@@ -289,12 +364,11 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
     }
     nvs = NvAPI_Stereo_Enable();
     if (nvs != NVAPI_OK) {
-        LOG_ERROR("NvAPI_Stereo_Enable failed (%d). "
-                  "Ensure 3D Vision is enabled in NVIDIA Control Panel.", nvs);
+        LOG_ERROR("NvAPI_Stereo_Enable failed (%d) -- ensure 3D Vision is on in NVIDIA Control Panel", nvs);
         return false;
     }
 
-    // ------ 2. Spin up message thread (does ALL D3D9 init inside) --------
+    // 2. Spin up message thread (ALL D3D9 init happens inside MsgThreadProc)
     m_msgStop  = false;
     m_initDone = false;
     m_initOk   = false;
@@ -314,18 +388,18 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
         return false;
     }
 
-    // ------ 3. Apply initial stereo parameters ---------------------------
+    // 3. Push initial stereo parameters into the driver
     SetSeparation(separation);
     SetConvergence(convergence);
 
     m_initialised = true;
-    LOG_INFO("NvapiStereoPresenter initialised (%ux%u@%uHz FSE, sep=%.1f, conv=%.2f)",
+    LOG_INFO("NvapiStereoPresenter initialised (%ux%u@%uHz FSE, sep=%.1f%%, conv=%.2f)",
              width, height, fseRate, separation, convergence);
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Stubs
+// Stubs (all real work moved to MsgThreadProc)
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::CreateD3D9Device(uint32_t, uint32_t, uint32_t) { return true; }
 bool NvapiStereoPresenter::EnableNvStereo()                                { return true; }
@@ -343,24 +417,25 @@ bool NvapiStereoPresenter::PresentStereoFrame(
     LOG_TRACE("PresentStereoFrame: enter");
 
     // Blit left eye D3D11 → D3D9 offscreen surface
-    LOG_TRACE("PresentStereoFrame: blitting left eye...");
     if (!BlitD3D11ToD3D9(leftSRV, d3d11Dev, m_leftSurface.Get(),
                           m_stagingTex, m_sysMemLeft)) return false;
 
-    // StretchRect directly to the LEFT back buffer plane
-    LOG_TRACE("PresentStereoFrame: StretchRect left -> backBufferLeft...");
+    // SetActiveEye(LEFT) → driver routes the following StretchRect to the left stereo plane
+    NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_LEFT);
     m_device->StretchRect(m_leftSurface.Get(), nullptr,
-                          m_backBufferLeft.Get(), nullptr, D3DTEXF_LINEAR);
+                          m_backBuffer.Get(), nullptr, D3DTEXF_LINEAR);
 
     // Blit right eye
-    LOG_TRACE("PresentStereoFrame: blitting right eye...");
     if (!BlitD3D11ToD3D9(rightSRV, d3d11Dev, m_rightSurface.Get(),
                           m_stagingTexRight, m_sysMemRight)) return false;
 
-    // StretchRect directly to the RIGHT back buffer plane
-    LOG_TRACE("PresentStereoFrame: StretchRect right -> backBufferRight...");
+    // SetActiveEye(RIGHT) → routes StretchRect to right stereo plane
+    NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_RIGHT);
     m_device->StretchRect(m_rightSurface.Get(), nullptr,
-                          m_backBufferRight.Get(), nullptr, D3DTEXF_LINEAR);
+                          m_backBuffer.Get(), nullptr, D3DTEXF_LINEAR);
+
+    // Reset to mono so unrelated D3D9 calls aren't accidentally routed
+    NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_MONO);
 
     // Present the stereo pair
     LOG_TRACE("PresentStereoFrame: PresentEx...");
@@ -394,7 +469,6 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     D3D11_TEXTURE2D_DESC srcDesc{};
     srcTex->GetDesc(&srcDesc);
 
-    // Invalidate cached staging tex if dims/format changed
     if (!stagingTex ||
         m_stagingWidth  != srcDesc.Width ||
         m_stagingHeight != srcDesc.Height ||
@@ -427,8 +501,7 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
     if (!sysMemSurf) {
         HRESULT h = m_device->CreateOffscreenPlainSurface(
             m_stagingWidth, m_stagingHeight,
-            D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM,
-            &sysMemSurf, nullptr);
+            D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sysMemSurf, nullptr);
         if (FAILED(h)) {
             LOG_ERROR("CreateOffscreenPlainSurface (sysmem) failed: 0x%08X", h);
             return false;
@@ -479,24 +552,23 @@ bool NvapiStereoPresenter::BlitD3D11ToD3D9(
 // ---------------------------------------------------------------------------
 void NvapiStereoPresenter::SetSeparation(float pct) {
     m_separation = std::max(0.0f, std::min(pct, 100.0f));
-    if (!m_stereoHandle) return;
-    NvAPI_Stereo_SetSeparation(m_stereoHandle, m_separation);
+    if (m_stereoHandle)
+        NvAPI_Stereo_SetSeparation(m_stereoHandle, m_separation);
     LOG_INFO("Separation: %.1f%%", m_separation);
 }
 
 void NvapiStereoPresenter::SetConvergence(float val) {
     m_convergence = std::max(0.0f, std::min(val, 25.0f));
-    if (!m_stereoHandle) return;
-    NvAPI_Stereo_SetConvergence(m_stereoHandle, m_convergence);
-    LOG_INFO("Convergence: %.2f", m_convergence);
+    if (m_stereoHandle)
+        NvAPI_Stereo_SetConvergence(m_stereoHandle, m_convergence);
+    LOG_INFO("Convergence: %.3f", m_convergence);
 }
 
 // ---------------------------------------------------------------------------
 // Destructor
 // ---------------------------------------------------------------------------
 NvapiStereoPresenter::~NvapiStereoPresenter() {
-    m_backBufferLeft.Reset();
-    m_backBufferRight.Reset();
+    m_backBuffer.Reset();
     m_leftSurface.Reset();
     m_rightSurface.Reset();
     m_stagingTex.Reset();

@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.21)
 project(XR3DV VERSION 1.0.0 LANGUAGES CXX)
 
+# --- Git hash for build identification ------------------------------------
+find_package(Git QUIET)
+set(XR3DV_GIT_HASH "unknown")
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} log -1 --format=%h
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE XR3DV_GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+message(STATUS "XR3DV build: v${PROJECT_VERSION} git=${XR3DV_GIT_HASH}")
+
 # ---------------------------------------------------------------------------
 # Global settings
 # ---------------------------------------------------------------------------
@@ -101,6 +115,7 @@ target_compile_definitions(xr3dv PRIVATE
     XR3DV_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     XR3DV_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     XR3DV_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    XR3DV_GIT_HASH="${XR3DV_GIT_HASH}"
 )
 
 target_compile_options(xr3dv PRIVATE
@@ -163,6 +178,7 @@ target_compile_definitions(xr3dv_diag PRIVATE
     XR3DV_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     XR3DV_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     XR3DV_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    XR3DV_GIT_HASH="${XR3DV_GIT_HASH}"
 )
 
 target_compile_options(xr3dv_diag PRIVATE

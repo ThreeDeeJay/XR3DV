@@ -1,33 +1,32 @@
 ; XR3DV runtime configuration
-; Place this file next to xr3dv.dll  OR  next to your game's .exe
-; (Game-local copy overrides only [Stereo] separation and convergence)
+; Global copy: place next to xr3dv.dll
+; Per-game copy: place next to the game .exe — overrides [Stereo] sep/conv only
 
 [Display]
-; Per-eye render resolution
 Width=1920
 Height=1080
 
-; Physical monitor refresh rate in Hz (used for D3D9 FSE device)
-; Must match a mode listed in the xr3dv.log adapter mode list
+; Physical monitor refresh rate Hz — used for D3D9 FSE device creation
 MonitorRate=120
 
-; Set HalfRate=true for shutter 3D displays (e.g. 120 Hz monitor, 60 fps per eye)
-; XR apps will be timed at MonitorRate/2; D3D9 still runs at MonitorRate
-HalfRate=false
+; HalfRate=true  → XR apps run at MonitorRate/2 fps (default: ON for shutter 3D)
+; HalfRate=false → XR apps run at MonitorRate fps
+HalfRate=true
 
 [Stereo]
-; Eye separation [0-100%]  — Ctrl+F3 decrease / Ctrl+F4 increase
+; Eye separation [0–100%]   Ctrl+F3 decrease / Ctrl+F4 increase (hold to repeat)
 Separation=50.0
 
-; Convergence [0-25]       — Ctrl+F5 decrease / Ctrl+F6 increase
+; Convergence [0–25]        Ctrl+F5 decrease / Ctrl+F6 increase (hold to repeat)
+; This value is linked to the native 3D Vision convergence shown in its OSD.
 Convergence=5.000
 
-; Save current values      — Ctrl+F7 (writes to game-local xr3dv.ini)
+; Ctrl+F7 = save current values to the per-game xr3dv.ini
 
 ; Interpupillary distance in metres
 IPD=0.064
 
 [Debug]
-; Log verbosity: 0=off 1=errors 2=info 3=verbose 4=trace
+; 0=off 1=errors 2=info 3=verbose 4=trace
 LogLevel=1
 LogFile=xr3dv.log

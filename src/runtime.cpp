@@ -33,8 +33,9 @@ bool RuntimeInit(Runtime** out) {
 
     g_runtime = rt;
     if (out) *out = rt;
-    LOG_INFO("XR3DV runtime initialised (v%d.%d.%d)",
-             XR3DV_VERSION_MAJOR, XR3DV_VERSION_MINOR, XR3DV_VERSION_PATCH);
+    LOG_INFO("XR3DV runtime initialised (v%d.%d.%d+%s)",
+             XR3DV_VERSION_MAJOR, XR3DV_VERSION_MINOR, XR3DV_VERSION_PATCH,
+             XR3DV_GIT_HASH);
     return true;
 }
 

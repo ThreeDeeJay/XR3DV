@@ -16,8 +16,6 @@
 
 namespace xr3dv {
 
-struct Config;
-
 class NvapiStereoPresenter {
 public:
     NvapiStereoPresenter() = default;
@@ -27,8 +25,8 @@ public:
     NvapiStereoPresenter& operator=(const NvapiStereoPresenter&) = delete;
 
     /// Create FSE D3D9 device and initialise NVAPI stereo.
-    /// @param fseRate      Full monitor refresh rate for D3D9 FSE (e.g. 120)
-    /// @param gameIniPath  Per-game ini path for hotkey save (may be empty)
+    /// @param fseRate      Full monitor refresh Hz for D3D9 FSE device
+    /// @param gameIniPath  Per-game ini for hotkey-save (may be "")
     bool Init(uint32_t width, uint32_t height,
               uint32_t fseRate,
               float separation, float convergence,
@@ -39,18 +37,19 @@ public:
         ID3D11ShaderResourceView* rightSRV,
         ID3D11Device*             d3d11Dev);
 
+    /// Called by PollConfigThread only when INI actually changed.
     void SetSeparation(float pct);
     void SetConvergence(float val);
 
     float GetSeparation()  const { return m_separation;  }
     float GetConvergence() const { return m_convergence; }
-
-    bool IsInitialised() const { return m_initialised; }
+    bool  IsInitialised()  const { return m_initialised; }
 
 private:
-    bool CreateD3D9Device(uint32_t, uint32_t, uint32_t);  // stub
-    bool EnableNvStereo();                                 // stub
-    bool CreateStagingResources(uint32_t, uint32_t);       // stub
+    // Stubs — all real work is in MsgThreadProc
+    bool CreateD3D9Device(uint32_t, uint32_t, uint32_t);
+    bool EnableNvStereo();
+    bool CreateStagingResources(uint32_t, uint32_t);
 
     void MsgThreadProc();
 
@@ -62,15 +61,13 @@ private:
         Microsoft::WRL::ComPtr<IDirect3DSurface9>&   sysMemSurf);
 
     // ------ D3D9 objects -------------------------------------------------
-    HWND                                       m_hwnd            = nullptr;
-    HWND                                       m_savedFgWnd      = nullptr; // game window to restore focus to
+    HWND                                       m_hwnd        = nullptr;
+    HWND                                       m_gameHwnd    = nullptr; // game's main window
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;
-    // Explicit left/right back buffer references (populated after stereo activate)
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBufferLeft;
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBufferRight;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer; // mono, SetActiveEye redirects it
 
     // ------ D3D11 staging textures (one per eye, cached) -----------------
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingTex;
@@ -92,15 +89,14 @@ private:
     std::atomic<bool> m_initDone{false};
     std::atomic<bool> m_initOk{false};
 
-    // ------ Hotkey IDs (registered in msg thread) -------------------------
-    static constexpr int HK_SEP_DEC  = 1;  // Ctrl+F3
-    static constexpr int HK_SEP_INC  = 2;  // Ctrl+F4
-    static constexpr int HK_CONV_DEC = 3;  // Ctrl+F5
-    static constexpr int HK_CONV_INC = 4;  // Ctrl+F6
-    static constexpr int HK_SAVE     = 5;  // Ctrl+F7
+    // Timer IDs used in message loop
+    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms — hotkey hold
+    static constexpr UINT_PTR TIMER_AUDIO_KEEP  = 2; // 2000 ms — keep game audio alive
+    static constexpr UINT_PTR TIMER_STEREO_SYNC = 3; // 500 ms  — sync sep/conv from 3DV OSD
 
-    static constexpr float kSepStep  = 1.0f;   // % per keypress
-    static constexpr float kConvStep = 0.1f;   // units per keypress
+    // Hotkey step sizes
+    static constexpr float kSepStep  = 1.0f;
+    static constexpr float kConvStep = 0.1f;
 
     // ------ State ---------------------------------------------------------
     bool        m_initialised = false;
