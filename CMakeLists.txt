@@ -88,7 +88,7 @@ set(XR3DV_SOURCES
     src/swapchain.cpp
     src/space.cpp
     src/actions.cpp
-    src/present_hook.cpp
+    src/nvapi_stereo.cpp
     src/logging.cpp
     src/timing.cpp
     src/xr3dv.def        # exported symbols
