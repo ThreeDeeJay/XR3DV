@@ -41,15 +41,16 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
     m_d3d11Dev = binding->device;
     m_d3d11Dev->GetImmediateContext(&m_d3d11Ctx);
 
-    // Initialise NVAPI stereo presenter
-    m_stereo = std::make_unique<NvapiStereoPresenter>();
-    if (!m_stereo->Init(m_cfg.width, m_cfg.height,
-                        m_cfg.monitorRate,          // FSE rate = full monitor Hz
-                        m_cfg.separation.load(),
-                        m_cfg.convergence.load(),
-                        m_cfg.gameIniPath))
+    // Initialise the windowed D3D9 stereo presenter (packed-surface approach).
+    if (!m_presenter.Init(
+            m_cfg.width, m_cfg.height,
+            m_cfg.monitorRate,
+            m_cfg.separation.load(),
+            m_cfg.convergence.load(),
+            m_cfg.swapEyes,
+            m_cfg.gameIniPath))
     {
-        LOG_ERROR("Failed to initialise NVAPI stereo presenter");
+        LOG_ERROR("Failed to initialise NvapiStereoPresenter");
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -68,10 +69,9 @@ void Session::PollConfigThread() {
     while (!m_pollStop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         bool changed = PollConfigReload(m_cfg);
-
-        if (changed && m_stereo && m_stereo->IsInitialised()) {
-            m_stereo->SetSeparation(m_cfg.separation.load());
-            m_stereo->SetConvergence(m_cfg.convergence.load());
+        if (changed && m_presenter.IsInitialised()) {
+            m_presenter.SetSeparation(m_cfg.separation.load());
+            m_presenter.SetConvergence(m_cfg.convergence.load());
         }
     }
 }
@@ -204,37 +204,30 @@ bool Session::PresentFrame(const XrFrameEndInfo* /*info*/) {
     Swapchain* right = GetSwapchain(m_rightSwapchain);
 
     if (!left || !right) {
-        LOG_VERBOSE("PresentFrame: missing left/right swapchain handles (left=%p right=%p)",
-                    (void*)m_leftSwapchain, (void*)m_rightSwapchain);
+        LOG_VERBOSE("PresentFrame: missing left/right swapchain handles");
         return false;
     }
-    LOG_TRACE("PresentFrame: left isDepth=%d right isDepth=%d",
-              (int)left->IsDepth(), (int)right->IsDepth());
-
     if (left->IsDepth() || right->IsDepth()) {
-        LOG_ERROR("EndFrame: projection view swapchain is a depth format — skipping blit");
+        LOG_ERROR("PresentFrame: projection view swapchain is depth — skipping");
         return false;
     }
 
     const auto* leftImg  = left->GetLatestImage();
     const auto* rightImg = right->GetLatestImage();
-
-    LOG_TRACE("PresentFrame: leftImg=%p rightImg=%p",
-              (const void*)leftImg, (const void*)rightImg);
-
     if (!leftImg || !rightImg) {
-        LOG_VERBOSE("PresentFrame: no acquired image yet (left=%p right=%p) -- skipping",
-                    (const void*)leftImg, (const void*)rightImg);
+        LOG_VERBOSE("PresentFrame: no acquired image yet — skipping");
         return false;
     }
 
     LOG_TRACE("PresentFrame: leftSRV=%p rightSRV=%p",
               (void*)leftImg->srv.Get(), (void*)rightImg->srv.Get());
+
+    // Call the windowed D3D9 presenter directly.
+    // It blits left+right into a packed W×(H*2+1) surface and presents via
+    // the NVAPI packed-stereo StretchRect technique.
     LOG_TRACE("PresentFrame: calling PresentStereoFrame...");
-    bool ok = m_stereo->PresentStereoFrame(
-        leftImg->srv.Get(),
-        rightImg->srv.Get(),
-        m_d3d11Dev.Get());
+    bool ok = m_presenter.PresentStereoFrame(
+        leftImg->srv.Get(), rightImg->srv.Get(), m_d3d11Dev.Get());
     LOG_TRACE("PresentFrame: PresentStereoFrame returned %s", ok ? "true" : "false");
     return ok;
 }

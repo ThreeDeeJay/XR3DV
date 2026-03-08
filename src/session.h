@@ -80,8 +80,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Device>        m_d3d11Dev;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_d3d11Ctx;
 
-    // NVAPI stereo presenter
-    std::unique_ptr<NvapiStereoPresenter>        m_stereo;
+    // Stereo presenter — windowed D3D9 + packed stereo surface approach
+    NvapiStereoPresenter m_presenter;
 
     // Frame timing
     FrameTimer   m_timer;

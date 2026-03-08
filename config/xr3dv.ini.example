@@ -6,7 +6,7 @@
 Width=1920
 Height=1080
 
-; Physical monitor refresh rate Hz — used for D3D9 FSE device creation
+; Physical monitor refresh rate Hz (informational — logged on startup)
 MonitorRate=120
 
 ; HalfRate=true  → XR apps run at MonitorRate/2 fps (default: ON for shutter 3D)
@@ -14,19 +14,26 @@ MonitorRate=120
 HalfRate=true
 
 [Stereo]
-; Eye separation [0–100%]   Ctrl+F3 decrease / Ctrl+F4 increase (hold to repeat)
+; Eye separation [0–100%]
+;   Ctrl+F3 decrease  /  Ctrl+F4 increase  (hold for continuous adjustment)
 Separation=50.0
 
-; Convergence [0–25]        Ctrl+F5 decrease / Ctrl+F6 increase (hold to repeat)
-; This value is linked to the native 3D Vision convergence shown in its OSD.
+; Convergence [0–25]
+;   Ctrl+F5 decrease  /  Ctrl+F6 increase  (hold for continuous adjustment)
+;   This value is bidirectionally linked to the native 3D Vision OSD —
+;   adjusting via 3DV hardware buttons will update this value automatically.
 Convergence=5.000
 
-; Ctrl+F7 = save current values to the per-game xr3dv.ini
+; Ctrl+F7 = save current separation/convergence to the per-game xr3dv.ini
 
 ; Interpupillary distance in metres
 IPD=0.064
 
+; If the left and right eyes appear swapped (wrong depth on near/far objects)
+; set SwapEyes=true
+SwapEyes=false
+
 [Debug]
-; 0=off 1=errors 2=info 3=verbose 4=trace
+; 0=off  1=errors  2=info  3=verbose  4=trace
 LogLevel=1
 LogFile=xr3dv.log

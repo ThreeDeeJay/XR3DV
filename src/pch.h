@@ -21,10 +21,10 @@
 #pragma comment(lib, "shlwapi.lib")
 
 // ---- DirectX (order matters) --------------------------------------------
-#include <d3d9.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 
 // ---- OpenXR: define the D3D11 platform flag BEFORE including the header -

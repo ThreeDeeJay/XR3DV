@@ -73,7 +73,7 @@ endif()
 find_package(DirectX QUIET)   # May not exist; fallback to SDK env
 set(DXSDK_DIR "$ENV{DXSDK_DIR}" CACHE PATH "DirectX SDK root")
 
-# Windows SDK provides d3d11; older DXSDK needed for d3d9 on some setups
+# D3D11 / DXGI from Windows SDK
 # We rely on the Windows SDK being in the default include paths via MSVC.
 
 # ---------------------------------------------------------------------------
@@ -88,8 +88,7 @@ set(XR3DV_SOURCES
     src/swapchain.cpp
     src/space.cpp
     src/actions.cpp
-    src/nvapi_stereo.cpp
-    src/d3d9_presenter.cpp
+    src/present_hook.cpp
     src/logging.cpp
     src/timing.cpp
     src/xr3dv.def        # exported symbols
@@ -126,7 +125,6 @@ target_compile_options(xr3dv PRIVATE
 )
 
 target_link_libraries(xr3dv PRIVATE
-    d3d9
     d3d11
     dxgi
     dxguid

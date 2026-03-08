@@ -32,6 +32,8 @@ struct Config {
     std::atomic<float> convergence { 5.0f  };
     /// Interpupillary distance in metres (used for view pose offsets).
     float ipd = 0.064f;
+    /// Swap left and right eyes if they appear reversed.
+    bool swapEyes = false;
 
     // ---- [Debug] ---------------------------------------------------------
     int         logLevel = 1;    ///< 0=off 1=errors 2=info 3=verbose 4=trace
