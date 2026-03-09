@@ -56,7 +56,17 @@ public:
 private:
     void MsgThreadProc();
 
+    /// Blit one D3D11 SRV into a W x H SYSMEM surface, then upload to DEFAULT.
+    /// Used by the SetActiveEye path.
+    bool BlitD3D11ToSurface(
+        ID3D11ShaderResourceView*               srv,
+        ID3D11Device*                           d3d11Dev,
+        IDirect3DSurface9*                      dstDefault,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex,
+        Microsoft::WRL::ComPtr<IDirect3DSurface9>& sysMemSurf);
+
     /// Blit one D3D11 SRV into the packed SYSMEM surface at yOffset.
+    /// Used by the packed-surface fallback path.
     bool BlitD3D11ToPacked(
         ID3D11ShaderResourceView*               srv,
         ID3D11Device*                           d3d11Dev,
@@ -69,10 +79,17 @@ private:
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
 
-    // Packed stereo surface: W x (H*2+1) — SYSMEM for CPU writes, DEFAULT for StretchRect
+    // SetActiveEye path: separate left/right surfaces
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;   // DEFAULT
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;  // DEFAULT
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;    // SYSTEMMEM intermediate
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemRight;
+
+    // Packed-surface fallback path: W x (H*2+1)
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedSysMem;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedDefault;
-    // Mono backbuffer — StretchRect destination
+
+    // Mono backbuffer — StretchRect destination for both paths
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer;
 
     // ------ D3D11 staging (one per eye, cached) --------------------------
@@ -83,7 +100,8 @@ private:
     DXGI_FORMAT m_stagingFormat = DXGI_FORMAT_UNKNOWN;
 
     // ------ NVAPI ---------------------------------------------------------
-    StereoHandle m_stereoHandle = nullptr;
+    StereoHandle       m_stereoHandle    = nullptr;
+    std::atomic<bool>  m_stereoActivated{false};  // true = SetActiveEye path is live
 
     // ------ Message-pump thread -------------------------------------------
     std::thread       m_msgThread;
