@@ -16,19 +16,15 @@
 
 namespace xr3dv {
 
-// ---------------------------------------------------------------------------
-// NV Packed-Stereo surface header (last row of a W x (H*2+1) surface).
-// The NVIDIA display driver DDI hook intercepts StretchRect from a surface
-// containing this signature and routes it to the left/right stereo planes.
-// Works in windowed mode; NvAPI_Stereo_Activate is NOT required.
-// ---------------------------------------------------------------------------
+// NV Packed-Stereo header — kept for reference / fallback experiments.
+// Primary path uses NvAPI_Stereo_SetActiveEye instead.
 #define NVSTEREO_IMAGE_SIGNATURE 0x4433445C
 struct NvStereoImageHeader {
-    DWORD signature;  // NVSTEREO_IMAGE_SIGNATURE
-    DWORD width;      // width of ONE eye in pixels
-    DWORD height;     // height of ONE eye in pixels
-    DWORD bpp;        // bits per pixel (32)
-    DWORD flags;      // 0 = normal, 1 = swap eyes
+    DWORD signature;
+    DWORD width;
+    DWORD height;
+    DWORD bpp;
+    DWORD flags;   // 0 = normal, 1 = swap eyes
 };
 
 class NvapiStereoPresenter {
@@ -39,8 +35,6 @@ public:
     NvapiStereoPresenter(const NvapiStereoPresenter&)            = delete;
     NvapiStereoPresenter& operator=(const NvapiStereoPresenter&) = delete;
 
-    /// Initialise D3D9 windowed device and NVAPI stereo.
-    /// @param fseRate  Monitor Hz (used only for log/info; device is windowed)
     bool Init(uint32_t width, uint32_t height,
               uint32_t fseRate,
               float separation, float convergence,
@@ -52,7 +46,6 @@ public:
         ID3D11ShaderResourceView* rightSRV,
         ID3D11Device*             d3d11Dev);
 
-    /// Called by PollConfigThread only when INI actually changed.
     void SetSeparation(float pct);
     void SetConvergence(float val);
 
@@ -63,35 +56,36 @@ public:
 private:
     void MsgThreadProc();
 
-    /// Blit one D3D11 eye texture into the packed SYSMEM surface at yOffset.
-    /// stagingTex is created/reused per-eye; both are class members.
-    bool BlitD3D11ToPacked(
+    /// Blit one D3D11 SRV → D3D9 DEFAULT surface via CPU staging.
+    bool BlitD3D11ToSurface(
         ID3D11ShaderResourceView*              srv,
         ID3D11Device*                          d3d11Dev,
-        uint32_t                               yOffset,
-        Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex);
+        IDirect3DSurface9*                     dst,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex,
+        Microsoft::WRL::ComPtr<IDirect3DSurface9>& sysMemSurf);
 
     // ------ D3D9 objects -------------------------------------------------
-    HWND                                       m_hwnd   = nullptr;
+    HWND                                       m_hwnd     = nullptr;
     HWND                                       m_gameHwnd = nullptr;
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
 
-    // Packed stereo composite surface: W x (H*2+1)
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedSysMem;   // SYSMEM — CPU writable
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedDefault;  // DEFAULT — GPU StretchRect src
-
-    // Normal W x H mono backbuffer (StretchRect destination)
+    // Per-eye DEFAULT pool surfaces (SetActiveEye routes StretchRect to correct plane)
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;
+    // Mono backbuffer — SetActiveEye redirects writes to left/right stereo plane
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer;
 
-    // ------ D3D11 staging textures (one per eye, cached) -----------------
+    // ------ D3D11 staging (one per eye, cached) --------------------------
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingLeft;
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingRight;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemRight;
     uint32_t    m_stagingWidth  = 0;
     uint32_t    m_stagingHeight = 0;
     DXGI_FORMAT m_stagingFormat = DXGI_FORMAT_UNKNOWN;
 
-    // ------ NVAPI (for SetSeparation / SetConvergence / stereo sync) ------
+    // ------ NVAPI ---------------------------------------------------------
     StereoHandle m_stereoHandle = nullptr;
 
     // ------ Message-pump thread -------------------------------------------
@@ -100,11 +94,9 @@ private:
     std::atomic<bool> m_initDone{false};
     std::atomic<bool> m_initOk{false};
 
-    // Timer IDs
-    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms — hotkey hold detection
-    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2; // 500 ms — sync sep/conv from 3DV OSD
+    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms
+    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2; // 500 ms
 
-    // Hotkey step sizes
     static constexpr float kSepStep  = 1.0f;
     static constexpr float kConvStep = 0.1f;
 
