@@ -56,13 +56,12 @@ public:
 private:
     void MsgThreadProc();
 
-    /// Blit one D3D11 SRV → D3D9 DEFAULT surface via CPU staging.
-    bool BlitD3D11ToSurface(
-        ID3D11ShaderResourceView*              srv,
-        ID3D11Device*                          d3d11Dev,
-        IDirect3DSurface9*                     dst,
-        Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex,
-        Microsoft::WRL::ComPtr<IDirect3DSurface9>& sysMemSurf);
+    /// Blit one D3D11 SRV into the packed SYSMEM surface at yOffset.
+    bool BlitD3D11ToPacked(
+        ID3D11ShaderResourceView*               srv,
+        ID3D11Device*                           d3d11Dev,
+        uint32_t                                yOffset,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex);
 
     // ------ D3D9 objects -------------------------------------------------
     HWND                                       m_hwnd     = nullptr;
@@ -70,17 +69,15 @@ private:
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
 
-    // Per-eye DEFAULT pool surfaces (SetActiveEye routes StretchRect to correct plane)
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;
-    // Mono backbuffer — SetActiveEye redirects writes to left/right stereo plane
+    // Packed stereo surface: W x (H*2+1) — SYSMEM for CPU writes, DEFAULT for StretchRect
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedSysMem;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedDefault;
+    // Mono backbuffer — StretchRect destination
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer;
 
     // ------ D3D11 staging (one per eye, cached) --------------------------
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingLeft;
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingRight;
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemRight;
     uint32_t    m_stagingWidth  = 0;
     uint32_t    m_stagingHeight = 0;
     DXGI_FORMAT m_stagingFormat = DXGI_FORMAT_UNKNOWN;
@@ -94,8 +91,8 @@ private:
     std::atomic<bool> m_initDone{false};
     std::atomic<bool> m_initOk{false};
 
-    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms
-    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2; // 500 ms
+    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms — hotkey hold
+    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2; // 500 ms — OSD sync + activation retry
 
     static constexpr float kSepStep  = 1.0f;
     static constexpr float kConvStep = 0.1f;
