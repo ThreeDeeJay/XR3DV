@@ -2,36 +2,41 @@
 //  Copyright (C) 2026 XR3DV Contributors
 //  SPDX-License-Identifier: GPL-3.0-or-later
 //
-//  Stereo presentation: FULLSCREEN-EXCLUSIVE D3D9Ex + NvAPI SetActiveEye.
+//  Stereo presentation: FULLSCREEN-EXCLUSIVE D3D9Ex on the GAME'S OWN HWND.
 //
-//  Presentation paths (selected at runtime by m_stereoActivated):
+//  Why the game's HWND, not a separate popup window:
+//    Audio engines (FMOD, WASAPI session management) poll GetForegroundWindow()
+//    to decide whether the application has focus. A separate XR3DV popup is the
+//    foreground window when 3DV is active, so the game believes it lost focus
+//    and pauses audio. Using the game's HWND as the D3D9 FSE window means the
+//    game window IS the foreground window at all times — focus, audio and input
+//    all work without any cross-thread focus manipulation.
 //
-//  PATH A — SetActiveEye (used when NvAPI_Stereo_IsActivated=YES):
-//    NvAPI_Stereo_SetActiveEye(LEFT)  → StretchRect(leftDefault  → backBuffer)
-//    NvAPI_Stereo_SetActiveEye(RIGHT) → StretchRect(rightDefault → backBuffer)
-//    NvAPI_Stereo_SetActiveEye(MONO)  → PresentEx
-//    The driver's nvapi.dll routes each StretchRect to the correct stereo plane.
-//    Works on 3D Fix Manager patched drivers (nvapi.dll is patched, not nvlddmkm.sys).
+//    OpenXR apps render via XR swapchain textures, NOT IDXGISwapChain::Present,
+//    so there is no D3D11 present on the game window to conflict with D3D9 FSE.
 //
-//  PATH B — Packed-surface fallback (IsActivated=NO):
-//    Write left into rows [0,H), right into [H,2H), NVSTEREOIMAGEHEADER into row [2H]
-//    of a W×(2H+1) surface. StretchRect W×(2H+1) → W×H backBuffer.
-//    Requires the nvlddmkm.sys DDI hook (retail drivers, not 3DFM-patched).
+//  Presentation paths (chosen at runtime by m_stereoActivated):
 //
-//  Audio / focus:
-//    The XR3DV window is given the game window as its Win32 OWNER before D3D9 FSE
-//    creation. Windows rule: when an owned window gains activation, the owner does
-//    NOT receive WM_ACTIVATE(INACTIVE). This covers both WndProc-based detection
-//    and GetForegroundWindow() polling (FMOD, WASAPI session checks) because from
-//    the OS perspective the owner is still the "active" application.
-//    A WndProc subclass is kept as a secondary defence for edge cases.
+//    PATH A — SetActiveEye (IsActivated=YES, 3DFM-patched nvapi.dll):
+//      SetActiveEye(L) → StretchRect(leftSurf → backBuffer)
+//      SetActiveEye(R) → StretchRect(rightSurf → backBuffer)
+//      SetActiveEye(MONO) → PresentEx
+//
+//    PATH B — Packed-surface fallback (IsActivated=NO, retail nvlddmkm.sys):
+//      Write L into rows [0,H), R into [H,2H), NVSTEREOIMAGEHEADER into row [2H]
+//      of a W×(2H+1) SYSTEMMEM surface. UpdateSurface → DEFAULT. StretchRect to
+//      W×H backbuffer. DDI hook in nvlddmkm.sys intercepts and routes to planes.
+//
+//  Message pump:
+//    No separate window. Timers use SetTimer(nullptr, …) which posts WM_TIMER
+//    to the thread queue. Custom messages use PostThreadMessageW(m_msgThreadId,…).
+//    PeekMessageW(nullptr,…) retrieves from both window and thread queues.
 
 #include "pch.h"
 #include "nvapi_stereo.h"
 #include "config.h"
 #include "logging.h"
-
-#include <windowsx.h>  // GET_X_LPARAM, GET_Y_LPARAM
+#include <windowsx.h>   // GET_X_LPARAM / GET_Y_LPARAM
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -41,11 +46,13 @@ using Microsoft::WRL::ComPtr;
 
 namespace xr3dv {
 
-static constexpr UINT WM_XR3DV_SET_OWNER      = WM_APP + 1;
-static constexpr UINT WM_XR3DV_RETRY_ACTIVATE = WM_APP + 2;
+static constexpr UINT WM_XR3DV_RETRY_ACTIVATE = WM_APP + 1;
 
 // ---------------------------------------------------------------------------
-// Game-window subclass (secondary defence — owner relationship is primary)
+// Game-window subclass
+// Primary purpose when using game HWND for D3D9: swallow WM_DISPLAYCHANGE and
+// WM_SIZE that D3D9 FSE mode-switch sends, so the game doesn't try to resize
+// its D3D11 resources. Secondary: swallow deactivation messages as fallback.
 // ---------------------------------------------------------------------------
 static WNDPROC g_origGameWndProc    = nullptr;
 static HWND    g_gameHwndSubclassed = nullptr;
@@ -53,6 +60,18 @@ static HWND    g_gameHwndSubclassed = nullptr;
 static LRESULT CALLBACK GameWndSubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_DISPLAYCHANGE:
+        LOG_VERBOSE("Subclass: swallowed WM_DISPLAYCHANGE");
+        return 0;
+    case WM_SIZE:
+        // Swallow resize caused by D3D9 FSE mode change.
+        // Let through SIZE_MINIMIZED / SIZE_MAXIMIZED so the game can still
+        // react to user-initiated window state changes (Alt+Tab etc.).
+        if (wp == SIZE_RESTORED) {
+            LOG_VERBOSE("Subclass: swallowed WM_SIZE(RESTORED) — D3D9 mode change");
+            return 0;
+        }
+        break;
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) {
             LOG_VERBOSE("Subclass: swallowed WM_ACTIVATE(INACTIVE)");
@@ -97,6 +116,10 @@ static void RemoveGameSubclass()
 
 // ---------------------------------------------------------------------------
 // Game window search
+//
+// Strategy: prefer GetForegroundWindow() if it belongs to our process — that
+// is the window the audio/input systems are bound to. Fall back to EnumWindows
+// largest-area search if nothing in-process has focus right now.
 // ---------------------------------------------------------------------------
 struct FindGameWndCtx { DWORD pid; HWND result; HWND exclude; LONG bestArea; };
 
@@ -114,109 +137,46 @@ static BOOL CALLBACK FindGameWndEnum(HWND hw, LPARAM lp)
 
 static HWND FindGameWindow(HWND excludeHwnd)
 {
-    FindGameWndCtx ctx{ GetCurrentProcessId(), nullptr, excludeHwnd, 0 };
+    DWORD ourPid = GetCurrentProcessId();
+
+    // Prefer the foreground window — it's the one that owns the audio session
+    HWND fg = GetForegroundWindow();
+    if (fg && fg != excludeHwnd) {
+        DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
+        if (pid == ourPid && IsWindowVisible(fg)) return fg;
+    }
+
+    // Fallback: largest visible top-level window in our process
+    FindGameWndCtx ctx{ ourPid, nullptr, excludeHwnd, 0 };
     EnumWindows(FindGameWndEnum, reinterpret_cast<LPARAM>(&ctx));
     return ctx.result;
 }
 
 // ---------------------------------------------------------------------------
-// FSE window procedure
-// Forwards input to game window with correct coordinate mapping.
-// Note: games using Raw Input (DirectInput, FMOD) won't respond to WM_MOUSE*
-// for in-game controls, but menus and UI still typically use WM messages.
+// Popup window (fallback only — used when no game window is found)
 // ---------------------------------------------------------------------------
-static HWND g_gameHwndForInput = nullptr;
-
-static POINT MapToGameCoords(HWND gameHwnd, LPARAM lp)
+static LRESULT CALLBACK PopupWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
-    POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-    // lp contains client coords relative to our FSE window (always at 0,0 full-screen).
-    // Map to screen then to game-window client.
-    if (gameHwnd) {
-        ClientToScreen(g_gameHwndForInput == gameHwnd ? (HWND)-1 : nullptr, &pt); // no-op for FSE at 0,0
-        ScreenToClient(gameHwnd, &pt);
-    }
-    return pt;
-}
-
-static LRESULT CALLBACK XR3DVWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
-{
-    HWND gh = g_gameHwndForInput;
-    switch (msg) {
-    case WM_MOUSEMOVE: {
-        if (!gh) return 0;
-        POINT pt; pt.x = GET_X_LPARAM(lp); pt.y = GET_Y_LPARAM(lp);
-        // FSE at 0,0 — coords are already screen coords, map to game client
-        ScreenToClient(gh, &pt);
-        PostMessageW(gh, msg, wp, MAKELPARAM(pt.x, pt.y));
-        return 0;
-    }
-    case WM_LBUTTONDOWN: case WM_LBUTTONUP:  case WM_LBUTTONDBLCLK:
-    case WM_RBUTTONDOWN: case WM_RBUTTONUP:  case WM_RBUTTONDBLCLK:
-    case WM_MBUTTONDOWN: case WM_MBUTTONUP:  case WM_MBUTTONDBLCLK: {
-        if (!gh) return 0;
-        POINT pt; pt.x = GET_X_LPARAM(lp); pt.y = GET_Y_LPARAM(lp);
-        ScreenToClient(gh, &pt);
-        // SendMessage (synchronous) for clicks — ensures the game's WndProc
-        // processes them immediately on the correct thread.
-        SendMessageW(gh, msg, wp, MAKELPARAM(pt.x, pt.y));
-        return 0;
-    }
-    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
-        if (gh) PostMessageW(gh, msg, wp, lp);
-        return 0;
-    case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
-    case WM_CHAR:    case WM_SYSCHAR:
-        if (gh) PostMessageW(gh, msg, wp, lp);
-        return 0;
-    }
     return DefWindowProcW(hw, msg, wp, lp);
 }
 
-// ---------------------------------------------------------------------------
-// MsgThreadProc
-// ---------------------------------------------------------------------------
-void NvapiStereoPresenter::MsgThreadProc()
+static HWND CreatePopupWindow(uint32_t width, uint32_t height)
 {
-    // ---- 1. Find game window BEFORE our window exists ----
-    m_gameHwnd = FindGameWindow(nullptr);
-    if (!m_gameHwnd) {
-        HWND fg = GetForegroundWindow();
-        DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
-        if (pid == GetCurrentProcessId()) m_gameHwnd = fg;
-    }
-    // Install subclass as secondary defence against deactivation
-    if (m_gameHwnd) {
-        InstallGameSubclass(m_gameHwnd);
-        g_gameHwndForInput = m_gameHwnd;
-    }
-    LOG_INFO("Pre-FSE game window: %p (subclassed=%s)",
-             (void*)m_gameHwnd, g_origGameWndProc ? "YES" : "NO");
+    static const wchar_t kClass[] = L"XR3DV_Popup";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc); wc.lpfnWndProc = PopupWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass;
+    RegisterClassExW(&wc);
 
-    // ---- 2. Create window ----
-    static const wchar_t kClass[] = L"XR3DV_D3D9";
-    {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc); wc.lpfnWndProc = XR3DVWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass;
-        RegisterClassExW(&wc);
-    }
-    m_hwnd = CreateWindowExW(0, kClass, L"XR3DV", WS_POPUP | WS_VISIBLE,
-                              0, 0, (int)m_width, (int)m_height,
-                              nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!m_hwnd) {
-        LOG_ERROR("CreateWindowEx failed GLE=%u", GetLastError());
-        RemoveGameSubclass(); m_initOk.store(false); m_initDone.store(true); return;
-    }
-
-    SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, (int)m_width, (int)m_height,
+    HWND hw = CreateWindowExW(0, kClass, L"XR3DV", WS_POPUP | WS_VISIBLE,
+                               0, 0, (int)width, (int)height,
+                               nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hw) return nullptr;
+    SetWindowPos(hw, HWND_TOPMOST, 0, 0, (int)width, (int)height,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    ShowWindow(m_hwnd, SW_SHOWNORMAL);
-    BringWindowToTop(m_hwnd);
-    SetForegroundWindow(m_hwnd);
-    SetActiveWindow(m_hwnd);
-    SetFocus(m_hwnd);
-
+    ShowWindow(hw, SW_SHOWNORMAL);
+    SetForegroundWindow(hw);
+    SetActiveWindow(hw);
     {
         MSG tmp;
         for (int i = 0; i < 5; ++i) {
@@ -226,10 +186,49 @@ void NvapiStereoPresenter::MsgThreadProc()
             }
         }
     }
-    LOG_INFO("D3D9 window HWND=%p foreground=%s active=%s",
-             (void*)m_hwnd,
-             GetForegroundWindow() == m_hwnd ? "YES" : "NO",
-             GetActiveWindow()     == m_hwnd ? "YES" : "NO");
+    return hw;
+}
+
+// ---------------------------------------------------------------------------
+// MsgThreadProc
+// ---------------------------------------------------------------------------
+void NvapiStereoPresenter::MsgThreadProc()
+{
+    m_msgThreadId = GetCurrentThreadId();
+
+    // ---- 1. Find game window ----
+    // GetForegroundWindow() is checked first: it's the window that owns the
+    // process's audio session. For ATS this is the main application window
+    // created early in startup; it retains focus throughout OpenXR init.
+    m_gameHwnd = FindGameWindow(nullptr);
+    if (m_gameHwnd) {
+        InstallGameSubclass(m_gameHwnd);
+        LOG_INFO("Pre-FSE game window: %p (subclassed=YES)", (void*)m_gameHwnd);
+    } else {
+        LOG_INFO("Pre-FSE game window: not found — will use popup fallback");
+    }
+
+    // ---- 2. Choose D3D9 device window ----
+    // Primary: game HWND (stays in focus → audio/input work naturally).
+    // Fallback: create a minimal popup window.
+    if (m_gameHwnd) {
+        m_hwnd      = m_gameHwnd;
+        m_ownedHwnd = nullptr;  // we did NOT create this window
+        // Ensure the game window is foreground for CreateDeviceEx
+        if (GetForegroundWindow() != m_hwnd) {
+            SetForegroundWindow(m_hwnd);
+            Sleep(50);
+        }
+    } else {
+        m_ownedHwnd = CreatePopupWindow(m_width, m_height);
+        if (!m_ownedHwnd) {
+            LOG_ERROR("CreatePopupWindow failed GLE=%u", GetLastError());
+            m_initOk.store(false); m_initDone.store(true); return;
+        }
+        m_hwnd = m_ownedHwnd;
+    }
+    LOG_INFO("D3D9 device window HWND=%p foreground=%s",
+             (void*)m_hwnd, GetForegroundWindow() == m_hwnd ? "YES" : "NO");
 
     // ---- 3. D3D9Ex ----
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
@@ -297,7 +296,7 @@ void NvapiStereoPresenter::MsgThreadProc()
     }
 
     // ---- 6. Surfaces ----
-    // PATH A: per-eye DEFAULT surfaces for SetActiveEye
+    // PATH A: per-eye surfaces for SetActiveEye
     hr  = m_device->CreateOffscreenPlainSurface(m_width, m_height, D3DFMT_X8R8G8B8,
                                                  D3DPOOL_DEFAULT,   &m_leftSurface,  nullptr);
     hr |= m_device->CreateOffscreenPlainSurface(m_width, m_height, D3DFMT_X8R8G8B8,
@@ -307,7 +306,7 @@ void NvapiStereoPresenter::MsgThreadProc()
     hr |= m_device->CreateOffscreenPlainSurface(m_width, m_height, D3DFMT_X8R8G8B8,
                                                  D3DPOOL_SYSTEMMEM, &m_sysMemRight,  nullptr);
     if (FAILED(hr))
-        LOG_ERROR("CreateOffscreenPlainSurface (per-eye) failed: 0x%08X — SetActiveEye path unavailable", hr);
+        LOG_ERROR("CreateOffscreenPlainSurface (per-eye) failed: 0x%08X", hr);
 
     // PATH B: packed W×(2H+1) fallback
     const UINT ph = m_height * 2 + 1;
@@ -316,7 +315,7 @@ void NvapiStereoPresenter::MsgThreadProc()
     hr |= m_device->CreateOffscreenPlainSurface(m_width, ph, D3DFMT_X8R8G8B8,
                                                  D3DPOOL_DEFAULT,   &m_packedDefault, nullptr);
     if (FAILED(hr))
-        LOG_ERROR("CreateOffscreenPlainSurface (packed) failed: 0x%08X — packed fallback unavailable", hr);
+        LOG_ERROR("CreateOffscreenPlainSurface (packed) failed: 0x%08X", hr);
 
     hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBuffer);
     if (FAILED(hr)) {
@@ -326,64 +325,39 @@ void NvapiStereoPresenter::MsgThreadProc()
     LOG_INFO("Stereo surfaces ready: per-eye %ux%u  packed %ux%u",
              m_width, m_height, m_width, ph);
 
-    // ---- 7. Refresh game window post-FSE ----
-    {
+    // ---- 7. Update game window reference post-FSE (popup fallback path only) ----
+    // When using the game's own HWND we're already on the right window.
+    // In the popup fallback, check if a better game window appeared during D3D9 init.
+    if (!m_gameHwnd) {
         HWND found = FindGameWindow(m_hwnd);
-        if (found && found != m_gameHwnd) {
-            LOG_INFO("Game window updated: %p -> %p", (void*)m_gameHwnd, (void*)found);
-            RemoveGameSubclass();
-            m_gameHwnd = found; g_gameHwndForInput = found;
+        if (found) {
+            m_gameHwnd = found;
             InstallGameSubclass(found);
-        } else if (!m_gameHwnd && found) {
-            m_gameHwnd = found; g_gameHwndForInput = found;
-            InstallGameSubclass(found);
+            LOG_INFO("Game window (post-FSE): %p", (void*)m_gameHwnd);
         }
     }
-    if (m_gameHwnd) LOG_INFO("Game window: %p", (void*)m_gameHwnd);
 
-    // ---- 8. Timers ----
+    // ---- 8. Timers (thread-queue, no window needed) ----
     SetTimer(nullptr, TIMER_INPUT_POLL,  50,  nullptr);
     SetTimer(nullptr, TIMER_STEREO_SYNC, 500, nullptr);
 
-    // ---- 9. Signal init done ----
-    // Do this BEFORE any cross-thread calls to avoid deadlocking the game thread
-    // that may be blocked in xrCreateSession waiting for m_initDone.
+    // ---- 9. Signal init complete ----
+    // No cross-thread calls needed here — game HWND is already in focus.
     m_initOk.store(true);
     m_initDone.store(true);
 
-    // Now that the game thread is unblocked, we can safely send cross-thread
-    // window messages. SetWindowLongPtrW(GWLP_HWNDPARENT) notifies the owner
-    // thread — safe only after the game thread can pump messages again.
-    PostMessageW(m_hwnd, WM_XR3DV_SET_OWNER,      0, 0);
-    PostMessageW(m_hwnd, WM_XR3DV_RETRY_ACTIVATE, 0, 0);
+    PostThreadMessageW(m_msgThreadId, WM_XR3DV_RETRY_ACTIVATE, 0, 0);
 
-    // ---- Message pump ----
+    // ---- Message pump (thread + window queue) ----
     while (!m_msgStop.load(std::memory_order_relaxed)) {
-        MSG msg;
         if (MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT,
                                          MWMO_INPUTAVAILABLE) != WAIT_TIMEOUT) {
+            MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT) { m_msgStop = true; goto done; }
 
-                if (msg.message == WM_XR3DV_SET_OWNER) {
-                    // Game thread is now unblocked — safe to set owner relationship.
-                    // Owned window rule: when we gain activation, the owner does NOT
-                    // receive WM_ACTIVATE(INACTIVE), covering GetForegroundWindow()
-                    // polling used by FMOD/WASAPI for audio session management.
-                    if (m_gameHwnd) {
-                        Sleep(150); // let xrCreateSession fully return
-                        SetWindowLongPtrW(m_hwnd, GWLP_HWNDPARENT,
-                                          reinterpret_cast<LONG_PTR>(m_gameHwnd));
-                        LOG_INFO("XR3DV window owner set to game window %p",
-                                 (void*)m_gameHwnd);
-                    }
-                    continue;
-                }
-
                 if (msg.message == WM_XR3DV_RETRY_ACTIVATE) {
                     if (m_device && m_stereoHandle && !m_stereoActivated.load()) {
-                        // Present a black dummy frame to prime the driver stereo
-                        // state machine before retrying NvAPI_Stereo_Activate.
                         m_device->Clear(0, nullptr, D3DCLEAR_TARGET,
                                         D3DCOLOR_XRGB(0,0,0), 1.f, 0);
                         m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
@@ -480,10 +454,9 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
         LOG_ERROR("NvAPI_Stereo_Enable failed (%d)", nvs);
 
     m_msgStop = false; m_initDone = false; m_initOk = false;
-    m_stereoActivated = false;
+    m_stereoActivated = false; m_msgThreadId = 0;
     m_msgThread = std::thread([this]() { MsgThreadProc(); });
 
-    // Wait up to 10 s — ATS is slow during initial load
     for (int i = 0; i < 1000 && !m_initDone.load(); ++i) Sleep(10);
     if (!m_initDone.load()) {
         LOG_ERROR("Timed out waiting for D3D9 init (10s)");
@@ -520,26 +493,23 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 
     if (m_stereoActivated.load()) {
         // ---- PATH A: SetActiveEye ----
-        // BlitD3D11ToSurface does: D3D11 staging → SYSMEM D3D9 → UpdateSurface → DEFAULT
         if (!BlitD3D11ToSurface(leftSRV,  d3d11Dev,
                                  m_leftSurface.Get(),  m_stagingLeft,  m_sysMemLeft))  return false;
         if (!BlitD3D11ToSurface(rightSRV, d3d11Dev,
                                  m_rightSurface.Get(), m_stagingRight, m_sysMemRight)) return false;
 
         HRESULT h;
-        const HWND eyeSel = m_swapEyes ? nullptr : nullptr; // no-op placeholder
-
         NvAPI_Stereo_SetActiveEye(m_stereoHandle,
                                    m_swapEyes ? NVAPI_STEREO_EYE_RIGHT : NVAPI_STEREO_EYE_LEFT);
         h = m_device->StretchRect(m_leftSurface.Get(),  nullptr,
                                    m_backBuffer.Get(),   nullptr, D3DTEXF_NONE);
-        if (FAILED(h)) { LOG_ERROR("StretchRect (left eye) failed: 0x%08X", h); return false; }
+        if (FAILED(h)) { LOG_ERROR("StretchRect (left) failed: 0x%08X", h); return false; }
 
         NvAPI_Stereo_SetActiveEye(m_stereoHandle,
                                    m_swapEyes ? NVAPI_STEREO_EYE_LEFT : NVAPI_STEREO_EYE_RIGHT);
         h = m_device->StretchRect(m_rightSurface.Get(), nullptr,
                                    m_backBuffer.Get(),   nullptr, D3DTEXF_NONE);
-        if (FAILED(h)) { LOG_ERROR("StretchRect (right eye) failed: 0x%08X", h); return false; }
+        if (FAILED(h)) { LOG_ERROR("StretchRect (right) failed: 0x%08X", h); return false; }
 
         NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_MONO);
 
@@ -561,10 +531,8 @@ bool NvapiStereoPresenter::PresentStereoFrame(
             auto* hdr = reinterpret_cast<NvStereoImageHeader*>(
                 static_cast<uint8_t*>(lr.pBits) + (size_t)2 * m_height * lr.Pitch);
             hdr->signature = NVSTEREO_IMAGE_SIGNATURE;
-            hdr->width     = m_width;
-            hdr->height    = m_height;
-            hdr->bpp       = 32;
-            hdr->flags     = m_swapEyes ? 1u : 0u;
+            hdr->width = m_width; hdr->height = m_height;
+            hdr->bpp   = 32;      hdr->flags  = m_swapEyes ? 1u : 0u;
             m_packedSysMem->UnlockRect();
         }
 
@@ -587,8 +555,8 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 }
 
 // ---------------------------------------------------------------------------
-// BlitD3D11ToSurface — D3D11 SRV -> D3D9 DEFAULT surface via CPU
-// Used by PATH A (SetActiveEye).
+// BlitD3D11ToSurface  (PATH A — SetActiveEye)
+// D3D11 SRV → D3D9 DEFAULT surface via CPU readback
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::BlitD3D11ToSurface(
     ID3D11ShaderResourceView*               srv,
@@ -604,7 +572,6 @@ bool NvapiStereoPresenter::BlitD3D11ToSurface(
     }
     D3D11_TEXTURE2D_DESC sd{}; srcTex->GetDesc(&sd);
 
-    // (Re)create staging texture if source changed
     if (!stagingTex || m_stagingWidth != sd.Width ||
         m_stagingHeight != sd.Height || m_stagingFormat != sd.Format) {
         stagingTex.Reset();
@@ -635,8 +602,8 @@ bool NvapiStereoPresenter::BlitD3D11ToSurface(
         LOG_ERROR("LockRect (sysMemSurf) failed: 0x%08X", hr); return false;
     }
 
-    const uint8_t* src  = static_cast<const uint8_t*>(mapped.pData);
-    uint8_t*       dst  = static_cast<uint8_t*>(lr.pBits);
+    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+    uint8_t*       dst = static_cast<uint8_t*>(lr.pBits);
     const size_t   rowB = (size_t)sd.Width * 4;
     for (uint32_t row = 0; row < sd.Height; ++row)
         memcpy(dst + (size_t)row * lr.Pitch,
@@ -645,15 +612,14 @@ bool NvapiStereoPresenter::BlitD3D11ToSurface(
     sysMemSurf->UnlockRect();
     ctx->Unmap(stagingTex.Get(), 0);
 
-    // Upload SYSTEMMEM → DEFAULT
     hr = m_device->UpdateSurface(sysMemSurf.Get(), nullptr, dstDefault, nullptr);
     if (FAILED(hr)) { LOG_ERROR("UpdateSurface (per-eye) failed: 0x%08X", hr); return false; }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// BlitD3D11ToPacked — D3D11 SRV -> packed SYSMEM surface at yOffset
-// Used by PATH B (packed-surface fallback).
+// BlitD3D11ToPacked  (PATH B — packed-surface fallback)
+// D3D11 SRV → packed SYSTEMMEM surface at yOffset
 // ---------------------------------------------------------------------------
 bool NvapiStereoPresenter::BlitD3D11ToPacked(
     ID3D11ShaderResourceView*   srv,
@@ -698,8 +664,8 @@ bool NvapiStereoPresenter::BlitD3D11ToPacked(
         LOG_ERROR("LockRect (packedSysMem) failed: 0x%08X", hr); return false;
     }
 
-    const uint8_t* src  = static_cast<const uint8_t*>(mapped.pData);
-    uint8_t*       dst  = static_cast<uint8_t*>(lr.pBits) + (size_t)yOffset * lr.Pitch;
+    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+    uint8_t*       dst = static_cast<uint8_t*>(lr.pBits) + (size_t)yOffset * lr.Pitch;
     const size_t   rowB = (size_t)sd.Width * 4;
     for (uint32_t row = 0; row < sd.Height; ++row)
         memcpy(dst + (size_t)row * lr.Pitch,
@@ -736,11 +702,16 @@ NvapiStereoPresenter::~NvapiStereoPresenter() {
     }
     m_device.Reset(); m_d3d9.Reset();
     RemoveGameSubclass();
-    g_gameHwndForInput = nullptr;
+
     m_msgStop = true;
-    if (m_hwnd) PostMessageW(m_hwnd, WM_QUIT, 0, 0);
+    if (m_msgThreadId)
+        PostThreadMessageW(m_msgThreadId, WM_QUIT, 0, 0);
     if (m_msgThread.joinable()) m_msgThread.join();
-    if (m_hwnd) { DestroyWindow(m_hwnd); m_hwnd = nullptr; }
+
+    // Only destroy window if we created it (popup fallback)
+    if (m_ownedHwnd) { DestroyWindow(m_ownedHwnd); m_ownedHwnd = nullptr; }
+    m_hwnd = nullptr;
+
     NvAPI_Unload();
 }
 

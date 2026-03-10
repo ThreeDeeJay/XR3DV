@@ -74,7 +74,8 @@ private:
         Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex);
 
     // ------ D3D9 objects -------------------------------------------------
-    HWND                                       m_hwnd     = nullptr;
+    HWND                                       m_hwnd     = nullptr; // D3D9 device window (game or popup)
+    HWND                                       m_ownedHwnd = nullptr; // non-null only if WE created the window
     HWND                                       m_gameHwnd = nullptr;
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
@@ -108,6 +109,7 @@ private:
     std::atomic<bool> m_msgStop{false};
     std::atomic<bool> m_initDone{false};
     std::atomic<bool> m_initOk{false};
+    DWORD             m_msgThreadId = 0;  // for PostThreadMessageW
 
     static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms — hotkey hold
     static constexpr UINT_PTR TIMER_STEREO_SYNC = 2; // 500 ms — OSD sync + activation retry
