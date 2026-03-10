@@ -41,7 +41,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace xr3dv {
 
-static constexpr UINT WM_XR3DV_RETRY_ACTIVATE = WM_APP + 1;
+static constexpr UINT WM_XR3DV_SET_OWNER      = WM_APP + 1;
+static constexpr UINT WM_XR3DV_RETRY_ACTIVATE = WM_APP + 2;
 
 // ---------------------------------------------------------------------------
 // Game-window subclass (secondary defence — owner relationship is primary)
@@ -208,16 +209,6 @@ void NvapiStereoPresenter::MsgThreadProc()
         RemoveGameSubclass(); m_initOk.store(false); m_initDone.store(true); return;
     }
 
-    // Set game window as Win32 OWNER of our window.
-    // Windows rule: when an owned window gains activation, the owner does NOT
-    // receive WM_ACTIVATE(INACTIVE) or WM_KILLFOCUS. This also means
-    // GetForegroundWindow()-based checks (FMOD, WASAPI) see the owner as active.
-    if (m_gameHwnd) {
-        SetWindowLongPtrW(m_hwnd, GWLP_HWNDPARENT,
-                          reinterpret_cast<LONG_PTR>(m_gameHwnd));
-        LOG_INFO("XR3DV window owner set to game window %p", (void*)m_gameHwnd);
-    }
-
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, (int)m_width, (int)m_height,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
     ShowWindow(m_hwnd, SW_SHOWNORMAL);
@@ -343,14 +334,9 @@ void NvapiStereoPresenter::MsgThreadProc()
             RemoveGameSubclass();
             m_gameHwnd = found; g_gameHwndForInput = found;
             InstallGameSubclass(found);
-            // Re-apply owner relationship to updated game window
-            SetWindowLongPtrW(m_hwnd, GWLP_HWNDPARENT,
-                              reinterpret_cast<LONG_PTR>(found));
         } else if (!m_gameHwnd && found) {
             m_gameHwnd = found; g_gameHwndForInput = found;
             InstallGameSubclass(found);
-            SetWindowLongPtrW(m_hwnd, GWLP_HWNDPARENT,
-                              reinterpret_cast<LONG_PTR>(found));
         }
     }
     if (m_gameHwnd) LOG_INFO("Game window: %p", (void*)m_gameHwnd);
@@ -365,7 +351,10 @@ void NvapiStereoPresenter::MsgThreadProc()
     m_initOk.store(true);
     m_initDone.store(true);
 
-    // Schedule stereo activation retry (dummy Present primes driver state machine)
+    // Now that the game thread is unblocked, we can safely send cross-thread
+    // window messages. SetWindowLongPtrW(GWLP_HWNDPARENT) notifies the owner
+    // thread — safe only after the game thread can pump messages again.
+    PostMessageW(m_hwnd, WM_XR3DV_SET_OWNER,      0, 0);
     PostMessageW(m_hwnd, WM_XR3DV_RETRY_ACTIVATE, 0, 0);
 
     // ---- Message pump ----
@@ -375,6 +364,21 @@ void NvapiStereoPresenter::MsgThreadProc()
                                          MWMO_INPUTAVAILABLE) != WAIT_TIMEOUT) {
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT) { m_msgStop = true; goto done; }
+
+                if (msg.message == WM_XR3DV_SET_OWNER) {
+                    // Game thread is now unblocked — safe to set owner relationship.
+                    // Owned window rule: when we gain activation, the owner does NOT
+                    // receive WM_ACTIVATE(INACTIVE), covering GetForegroundWindow()
+                    // polling used by FMOD/WASAPI for audio session management.
+                    if (m_gameHwnd) {
+                        Sleep(150); // let xrCreateSession fully return
+                        SetWindowLongPtrW(m_hwnd, GWLP_HWNDPARENT,
+                                          reinterpret_cast<LONG_PTR>(m_gameHwnd));
+                        LOG_INFO("XR3DV window owner set to game window %p",
+                                 (void*)m_gameHwnd);
+                    }
+                    continue;
+                }
 
                 if (msg.message == WM_XR3DV_RETRY_ACTIVATE) {
                     if (m_device && m_stereoHandle && !m_stereoActivated.load()) {
