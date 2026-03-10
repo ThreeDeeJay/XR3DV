@@ -31,6 +31,8 @@
 #include "config.h"
 #include "logging.h"
 
+#include <windowsx.h>  // GET_X_LPARAM, GET_Y_LPARAM
+
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
