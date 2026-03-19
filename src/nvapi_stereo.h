@@ -16,8 +16,6 @@
 
 namespace xr3dv {
 
-// NV Packed-Stereo header — kept for reference / fallback experiments.
-// Primary path uses NvAPI_Stereo_SetActiveEye instead.
 #define NVSTEREO_IMAGE_SIGNATURE 0x4433445C
 struct NvStereoImageHeader {
     DWORD signature;
@@ -53,11 +51,18 @@ public:
     float GetConvergence() const { return m_convergence; }
     bool  IsInitialised()  const { return m_initialised; }
 
+    // Mouse-look: called each frame by Session::LocateViews.
+    // Atomically consumes accumulated delta and recenter flag.
+    // dx/dy are in pixels (positive = right/down).
+    void ConsumeDelta(int32_t& dx, int32_t& dy, bool& recenter) {
+        dx      = m_mouseDeltaX.exchange(0, std::memory_order_relaxed);
+        dy      = m_mouseDeltaY.exchange(0, std::memory_order_relaxed);
+        recenter = m_recenterRequested.exchange(false, std::memory_order_relaxed);
+    }
+
 private:
     void MsgThreadProc();
 
-    /// Blit one D3D11 SRV into a W x H SYSMEM surface, then upload to DEFAULT.
-    /// Used by the SetActiveEye path.
     bool BlitD3D11ToSurface(
         ID3D11ShaderResourceView*               srv,
         ID3D11Device*                           d3d11Dev,
@@ -65,8 +70,6 @@ private:
         Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex,
         Microsoft::WRL::ComPtr<IDirect3DSurface9>& sysMemSurf);
 
-    /// Blit one D3D11 SRV into the packed SYSMEM surface at yOffset.
-    /// Used by the packed-surface fallback path.
     bool BlitD3D11ToPacked(
         ID3D11ShaderResourceView*               srv,
         ID3D11Device*                           d3d11Dev,
@@ -74,26 +77,26 @@ private:
         Microsoft::WRL::ComPtr<ID3D11Texture2D>& stagingTex);
 
     // ------ D3D9 objects -------------------------------------------------
-    HWND                                       m_hwnd     = nullptr; // D3D9 device window (game or popup)
-    HWND                                       m_ownedHwnd = nullptr; // non-null only if WE created the window
-    HWND                                       m_gameHwnd = nullptr;
+    HWND                                       m_hwnd      = nullptr; // device window (always popup)
+    HWND                                       m_ownedHwnd = nullptr; // same — we always own it
+    HWND                                       m_gameHwnd  = nullptr; // game's main window
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       m_d3d9;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> m_device;
 
-    // SetActiveEye path: separate left/right surfaces
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;   // DEFAULT
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;  // DEFAULT
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;    // SYSTEMMEM intermediate
+    // PATH A: per-eye surfaces for SetActiveEye
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_leftSurface;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_rightSurface;
+    Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemLeft;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_sysMemRight;
 
-    // Packed-surface fallback path: W x (H*2+1)
+    // PATH B: packed W×(2H+1) fallback
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedSysMem;
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_packedDefault;
 
-    // Mono backbuffer — StretchRect destination for both paths
+    // Mono backbuffer
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  m_backBuffer;
 
-    // ------ D3D11 staging (one per eye, cached) --------------------------
+    // ------ D3D11 staging ------------------------------------------------
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingLeft;
     Microsoft::WRL::ComPtr<ID3D11Texture2D>    m_stagingRight;
     uint32_t    m_stagingWidth  = 0;
@@ -102,17 +105,25 @@ private:
 
     // ------ NVAPI ---------------------------------------------------------
     StereoHandle       m_stereoHandle    = nullptr;
-    std::atomic<bool>  m_stereoActivated{false};  // true = SetActiveEye path is live
+    std::atomic<bool>  m_stereoActivated{false};
+
+    // ------ Mouse-look (written by MsgThread, read by game thread) --------
+    std::atomic<int32_t> m_mouseDeltaX{0};
+    std::atomic<int32_t> m_mouseDeltaY{0};
+    std::atomic<bool>    m_recenterRequested{false};
+    // Centre of FSE screen — cursor is warped here each WM_INPUT frame
+    int32_t m_centerX = 0;
+    int32_t m_centerY = 0;
 
     // ------ Message-pump thread -------------------------------------------
     std::thread       m_msgThread;
     std::atomic<bool> m_msgStop{false};
     std::atomic<bool> m_initDone{false};
     std::atomic<bool> m_initOk{false};
-    DWORD             m_msgThreadId = 0;  // for PostThreadMessageW
+    DWORD             m_msgThreadId = 0;
 
-    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1; // 50 ms — hotkey hold
-    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2; // 500 ms — OSD sync + activation retry
+    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1;
+    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2;
 
     static constexpr float kSepStep  = 1.0f;
     static constexpr float kConvStep = 0.1f;

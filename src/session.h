@@ -98,6 +98,10 @@ private:
     std::thread  m_pollThread;
     std::atomic<bool> m_pollStop{false};
 
+    // Mouse-look state (accumulated from presenter, applied in LocateViews)
+    float m_yaw   = 0.f;  // radians, positive = right
+    float m_pitch = 0.f;  // radians, positive = up
+
     // Eye identification stored during EndFrame
     XrSwapchain  m_leftSwapchain  = XR_NULL_HANDLE;
     XrSwapchain  m_rightSwapchain = XR_NULL_HANDLE;

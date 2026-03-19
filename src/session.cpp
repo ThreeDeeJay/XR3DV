@@ -277,8 +277,35 @@ Swapchain* Session::GetSwapchain(XrSwapchain handle) {
 }
 
 // ---------------------------------------------------------------------------
-// Views — identity pose, no head tracking
+// Views — mouse-look head pose with IPD offset
 // ---------------------------------------------------------------------------
+// Mouse sensitivity: pixels → radians.  Tune via xr3dv.ini [Input] if added.
+static constexpr float kMouseSensitivity = 0.001f; // rad/pixel
+static constexpr float kPitchLimit       = 1.48f;  // ~85 degrees
+
+// Multiply two quaternions (Hamilton product)
+static XrQuaternionf QMul(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return {
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    };
+}
+
+// Rotate a vector by a quaternion: v' = q * (0,v) * q^-1
+static XrVector3f QRotate(const XrQuaternionf& q, XrVector3f v) {
+    // Using the optimised formula: v' = v + 2q.w*(q.xyz × v) + 2*(q.xyz × (q.xyz × v))
+    float tx = 2.f * (q.y*v.z - q.z*v.y);
+    float ty = 2.f * (q.z*v.x - q.x*v.z);
+    float tz = 2.f * (q.x*v.y - q.y*v.x);
+    return {
+        v.x + q.w*tx + (q.y*tz - q.z*ty),
+        v.y + q.w*ty + (q.z*tx - q.x*tz),
+        v.z + q.w*tz + (q.x*ty - q.y*tx)
+    };
+}
+
 XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
                                XrViewState*             viewState,
                                uint32_t                 cap,
@@ -289,6 +316,28 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
     if (cap == 0) return XR_SUCCESS;
     if (cap < 2)  return XR_ERROR_SIZE_INSUFFICIENT;
 
+    // Consume mouse deltas from the presenter
+    int32_t dx = 0, dy = 0; bool recenter = false;
+    if (m_presenter.IsInitialised())
+        m_presenter.ConsumeDelta(dx, dy, recenter);
+
+    if (recenter) {
+        m_yaw = m_pitch = 0.f;
+        LOG_INFO("Head pose recentered");
+    } else {
+        m_yaw   -= static_cast<float>(dx) * kMouseSensitivity;
+        m_pitch -= static_cast<float>(dy) * kMouseSensitivity;
+        if (m_pitch >  kPitchLimit) m_pitch =  kPitchLimit;
+        if (m_pitch < -kPitchLimit) m_pitch = -kPitchLimit;
+    }
+
+    // Build head orientation: yaw around Y (world-up), then pitch around X (local-right)
+    float hy = sinf(m_yaw   * 0.5f), hw = cosf(m_yaw   * 0.5f); // Y-axis rotation
+    float px = sinf(m_pitch * 0.5f), pw = cosf(m_pitch * 0.5f); // X-axis rotation
+    XrQuaternionf qYaw   = {0.f, hy, 0.f, hw};
+    XrQuaternionf qPitch = {px,  0.f, 0.f, pw};
+    XrQuaternionf headQ  = QMul(qYaw, qPitch); // yaw applied first (world space)
+
     viewState->viewStateFlags =
         XR_VIEW_STATE_POSITION_VALID_BIT    |
         XR_VIEW_STATE_ORIENTATION_VALID_BIT |
@@ -296,21 +345,16 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
         XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
 
     float halfIpd = m_cfg.ipd * 0.5f;
-
-    // Hardcoded 90° horizontal FoV stereo pair
-    static const float kFov = 0.7854f; // 45°
+    static const float kFov = 0.7854f; // 45° each side
 
     for (int eye = 0; eye < 2; ++eye) {
         views[eye].type = XR_TYPE_VIEW;
         views[eye].next = nullptr;
-
-        // Identity orientation
-        views[eye].pose.orientation = {0.f, 0.f, 0.f, 1.f};
-
-        // Eye offset on X axis
-        float offset = (eye == 0) ? -halfIpd : halfIpd;
-        views[eye].pose.position = {offset, 0.f, 0.f};
-
+        views[eye].pose.orientation = headQ;
+        // Eye position = head origin + head-rotated IPD offset
+        float sign = (eye == 0) ? -1.f : 1.f;
+        XrVector3f localOffset = {sign * halfIpd, 0.f, 0.f};
+        views[eye].pose.position = QRotate(headQ, localOffset);
         views[eye].fov = {-kFov, kFov, kFov, -kFov};
     }
     return XR_SUCCESS;
