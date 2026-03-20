@@ -51,14 +51,17 @@ public:
     float GetConvergence() const { return m_convergence; }
     bool  IsInitialised()  const { return m_initialised; }
 
-    // Mouse-look: called each frame by Session::LocateViews.
-    // Atomically consumes accumulated delta and recenter flag.
-    // dx/dy are in pixels (positive = right/down).
+    // Mouse-look: consumed each frame by Session::LocateViews.
     void ConsumeDelta(int32_t& dx, int32_t& dy, bool& recenter) {
-        dx      = m_mouseDeltaX.exchange(0, std::memory_order_relaxed);
-        dy      = m_mouseDeltaY.exchange(0, std::memory_order_relaxed);
+        dx       = m_mouseDeltaX.exchange(0, std::memory_order_relaxed);
+        dy       = m_mouseDeltaY.exchange(0, std::memory_order_relaxed);
         recenter = m_recenterRequested.exchange(false, std::memory_order_relaxed);
     }
+
+    // Written by PopupWndProc (free function) via WM_INPUT — must be public.
+    std::atomic<int32_t> m_mouseDeltaX{0};
+    std::atomic<int32_t> m_mouseDeltaY{0};
+    std::atomic<bool>    m_recenterRequested{false};
 
 private:
     void MsgThreadProc();
@@ -107,11 +110,7 @@ private:
     StereoHandle       m_stereoHandle    = nullptr;
     std::atomic<bool>  m_stereoActivated{false};
 
-    // ------ Mouse-look (written by MsgThread, read by game thread) --------
-    std::atomic<int32_t> m_mouseDeltaX{0};
-    std::atomic<int32_t> m_mouseDeltaY{0};
-    std::atomic<bool>    m_recenterRequested{false};
-    // Centre of FSE screen — cursor is warped here each WM_INPUT frame
+    // ------ Mouse-look centre (written by msg thread only) ---------------
     int32_t m_centerX = 0;
     int32_t m_centerY = 0;
 
