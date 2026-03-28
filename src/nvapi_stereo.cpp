@@ -541,8 +541,12 @@ bool NvapiStereoPresenter::PresentStereoFrame(
         if (!m_packedSysMem || !m_packedDefault) {
             LOG_ERROR("Packed surfaces not available"); return false;
         }
-        if (!BlitD3D11ToPacked(leftSRV,  d3d11Dev, 0,        m_stagingLeft))  return false;
-        if (!BlitD3D11ToPacked(rightSRV, d3d11Dev, m_height, m_stagingRight)) return false;
+        // NVIDIA packed: top->left eye, bottom->right eye. OpenXR views[0] is optical right here.
+        // SwapEyes=true in xr3dv.ini inverts if needed.
+        auto* topSRV = m_swapEyes ? leftSRV  : rightSRV;
+        auto* botSRV = m_swapEyes ? rightSRV : leftSRV;
+        if (!BlitD3D11ToPacked(topSRV, d3d11Dev, 0,        m_stagingLeft))  return false;
+        if (!BlitD3D11ToPacked(botSRV, d3d11Dev, m_height, m_stagingRight)) return false;
 
         {
             D3DLOCKED_RECT lr{};
