@@ -511,68 +511,83 @@ bool NvapiStereoPresenter::PresentStereoFrame(
     ID3D11Device*             d3d11Dev)
 {
     if (!m_initialised) return false;
-    LOG_TRACE("PresentStereoFrame: path=%s",
-              m_stereoActivated.load() ? "SetActiveEye" : "packed");
 
-    if (m_stereoActivated.load()) {
+    // PATH A: SetActiveEye — attempted unconditionally.
+    // On 3DFM-patched drivers IsActivated() returns NO as a quirk, but
+    // NvAPI_Stereo_SetActiveEye() still routes StretchRect to the correct
+    // stereo plane.  We detect failure at runtime: if both StretchRects
+    // succeed we stay on PATH A; on first D3DERR_INVALIDCALL we fall through
+    // to PATH B (packed surface, retail drivers with nvlddmkm.sys DDI hook).
+    if (m_leftSurface && m_rightSurface && m_sysMemLeft && m_sysMemRight) {
         if (!BlitD3D11ToSurface(leftSRV,  d3d11Dev,
                                  m_leftSurface.Get(),  m_stagingLeft,  m_sysMemLeft))  return false;
         if (!BlitD3D11ToSurface(rightSRV, d3d11Dev,
                                  m_rightSurface.Get(), m_stagingRight, m_sysMemRight)) return false;
 
-        HRESULT h;
         NvAPI_Stereo_SetActiveEye(m_stereoHandle,
                                    m_swapEyes ? NVAPI_STEREO_EYE_RIGHT : NVAPI_STEREO_EYE_LEFT);
-        h = m_device->StretchRect(m_leftSurface.Get(),  nullptr,
-                                   m_backBuffer.Get(),   nullptr, D3DTEXF_NONE);
-        if (FAILED(h)) { LOG_ERROR("StretchRect (left) 0x%08X", h); return false; }
+        HRESULT hL = m_device->StretchRect(m_leftSurface.Get(), nullptr,
+                                            m_backBuffer.Get(),  nullptr, D3DTEXF_NONE);
 
         NvAPI_Stereo_SetActiveEye(m_stereoHandle,
                                    m_swapEyes ? NVAPI_STEREO_EYE_LEFT : NVAPI_STEREO_EYE_RIGHT);
-        h = m_device->StretchRect(m_rightSurface.Get(), nullptr,
-                                   m_backBuffer.Get(),   nullptr, D3DTEXF_NONE);
-        if (FAILED(h)) { LOG_ERROR("StretchRect (right) 0x%08X", h); return false; }
+        HRESULT hR = m_device->StretchRect(m_rightSurface.Get(), nullptr,
+                                            m_backBuffer.Get(),   nullptr, D3DTEXF_NONE);
 
         NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_MONO);
-        h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-        if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
 
-    } else {
-        if (!m_packedSysMem || !m_packedDefault) {
-            LOG_ERROR("Packed surfaces not available"); return false;
+        if (SUCCEEDED(hL) && SUCCEEDED(hR)) {
+            // PATH A succeeded — eye routing is live.
+            if (!m_stereoActivated.exchange(true)) {
+                LOG_INFO("PresentStereoFrame: PATH A (SetActiveEye) active");
+            }
+            HRESULT h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+            if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
+            return true;
         }
-        // NVIDIA packed: top->left eye, bottom->right eye. OpenXR views[0] is optical right here.
-        // SwapEyes=true in xr3dv.ini inverts if needed.
-        auto* topSRV = m_swapEyes ? leftSRV  : rightSRV;
-        auto* botSRV = m_swapEyes ? rightSRV : leftSRV;
-        if (!BlitD3D11ToPacked(topSRV, d3d11Dev, 0,        m_stagingLeft))  return false;
-        if (!BlitD3D11ToPacked(botSRV, d3d11Dev, m_height, m_stagingRight)) return false;
-
-        {
-            D3DLOCKED_RECT lr{};
-            HRESULT h = m_packedSysMem->LockRect(&lr, nullptr, 0);
-            if (FAILED(h)) { LOG_ERROR("LockRect (header) 0x%08X", h); return false; }
-            auto* hdr = reinterpret_cast<NvStereoImageHeader*>(
-                static_cast<uint8_t*>(lr.pBits) + (size_t)2 * m_height * lr.Pitch);
-            hdr->signature = NVSTEREO_IMAGE_SIGNATURE;
-            hdr->width = m_width; hdr->height = m_height;
-            hdr->bpp   = 32;      hdr->flags  = m_swapEyes ? 1u : 0u;
-            m_packedSysMem->UnlockRect();
+        // PATH A failed (SetActiveEye not routing on this driver build).
+        if (m_stereoActivated.exchange(false)) {
+            LOG_INFO("PresentStereoFrame: PATH A failed, falling back to PATH B (packed)");
         }
-
-        HRESULT h = m_device->UpdateSurface(
-            m_packedSysMem.Get(), nullptr, m_packedDefault.Get(), nullptr);
-        if (FAILED(h)) { LOG_ERROR("UpdateSurface 0x%08X", h); return false; }
-
-        RECT src{ 0, 0, (LONG)m_width, (LONG)(m_height * 2 + 1) };
-        RECT dst{ 0, 0, (LONG)m_width, (LONG)m_height };
-        h = m_device->StretchRect(
-            m_packedDefault.Get(), &src, m_backBuffer.Get(), &dst, D3DTEXF_POINT);
-        if (FAILED(h)) { LOG_ERROR("StretchRect (packed) 0x%08X", h); return false; }
-
-        h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-        if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
     }
+
+    // PATH B: packed-surface fallback.
+    // Left eye = top half (rows 0..H-1), right eye = bottom half (rows H..2H-1).
+    // The NVIDIA DDI hook in nvlddmkm.sys intercepts the StretchRect and routes
+    // each half to the correct stereo plane at full W×H resolution.
+    // SwapEyes=true in xr3dv.ini swaps the halves if eyes appear reversed.
+    if (!m_packedSysMem || !m_packedDefault) {
+        LOG_ERROR("Packed surfaces not available"); return false;
+    }
+    ID3D11ShaderResourceView* topSRV = m_swapEyes ? rightSRV : leftSRV;
+    ID3D11ShaderResourceView* botSRV = m_swapEyes ? leftSRV  : rightSRV;
+    if (!BlitD3D11ToPacked(topSRV, d3d11Dev, 0,        m_stagingLeft))  return false;
+    if (!BlitD3D11ToPacked(botSRV, d3d11Dev, m_height, m_stagingRight)) return false;
+
+    {
+        D3DLOCKED_RECT lr{};
+        HRESULT h = m_packedSysMem->LockRect(&lr, nullptr, 0);
+        if (FAILED(h)) { LOG_ERROR("LockRect (header) 0x%08X", h); return false; }
+        auto* hdr = reinterpret_cast<NvStereoImageHeader*>(
+            static_cast<uint8_t*>(lr.pBits) + (size_t)2 * m_height * lr.Pitch);
+        hdr->signature = NVSTEREO_IMAGE_SIGNATURE;
+        hdr->width = m_width; hdr->height = m_height;
+        hdr->bpp   = 32;      hdr->flags  = 0u; // eye swap handled by topSRV/botSRV above
+        m_packedSysMem->UnlockRect();
+    }
+
+    HRESULT h = m_device->UpdateSurface(
+        m_packedSysMem.Get(), nullptr, m_packedDefault.Get(), nullptr);
+    if (FAILED(h)) { LOG_ERROR("UpdateSurface 0x%08X", h); return false; }
+
+    RECT src{ 0, 0, (LONG)m_width, (LONG)(m_height * 2 + 1) };
+    RECT dst{ 0, 0, (LONG)m_width, (LONG)m_height };
+    h = m_device->StretchRect(
+        m_packedDefault.Get(), &src, m_backBuffer.Get(), &dst, D3DTEXF_POINT);
+    if (FAILED(h)) { LOG_ERROR("StretchRect (packed) 0x%08X", h); return false; }
+
+    h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+    if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
     return true;
 }
 
