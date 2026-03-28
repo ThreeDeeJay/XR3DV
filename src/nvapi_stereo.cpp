@@ -512,53 +512,18 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 {
     if (!m_initialised) return false;
 
-    // PATH A: SetActiveEye — attempted unconditionally.
-    // On 3DFM-patched drivers IsActivated() returns NO as a quirk, but
-    // NvAPI_Stereo_SetActiveEye() still routes StretchRect to the correct
-    // stereo plane.  We detect failure at runtime: if both StretchRects
-    // succeed we stay on PATH A; on first D3DERR_INVALIDCALL we fall through
-    // to PATH B (packed surface, retail drivers with nvlddmkm.sys DDI hook).
-    if (m_leftSurface && m_rightSurface && m_sysMemLeft && m_sysMemRight) {
-        if (!BlitD3D11ToSurface(leftSRV,  d3d11Dev,
-                                 m_leftSurface.Get(),  m_stagingLeft,  m_sysMemLeft))  return false;
-        if (!BlitD3D11ToSurface(rightSRV, d3d11Dev,
-                                 m_rightSurface.Get(), m_stagingRight, m_sysMemRight)) return false;
-
-        NvAPI_Stereo_SetActiveEye(m_stereoHandle,
-                                   m_swapEyes ? NVAPI_STEREO_EYE_RIGHT : NVAPI_STEREO_EYE_LEFT);
-        HRESULT hL = m_device->StretchRect(m_leftSurface.Get(), nullptr,
-                                            m_backBuffer.Get(),  nullptr, D3DTEXF_NONE);
-
-        NvAPI_Stereo_SetActiveEye(m_stereoHandle,
-                                   m_swapEyes ? NVAPI_STEREO_EYE_LEFT : NVAPI_STEREO_EYE_RIGHT);
-        HRESULT hR = m_device->StretchRect(m_rightSurface.Get(), nullptr,
-                                            m_backBuffer.Get(),   nullptr, D3DTEXF_NONE);
-
-        NvAPI_Stereo_SetActiveEye(m_stereoHandle, NVAPI_STEREO_EYE_MONO);
-
-        if (SUCCEEDED(hL) && SUCCEEDED(hR)) {
-            // PATH A succeeded — eye routing is live.
-            if (!m_stereoActivated.exchange(true)) {
-                LOG_INFO("PresentStereoFrame: PATH A (SetActiveEye) active");
-            }
-            HRESULT h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-            if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
-            return true;
-        }
-        // PATH A failed (SetActiveEye not routing on this driver build).
-        if (m_stereoActivated.exchange(false)) {
-            LOG_INFO("PresentStereoFrame: PATH A failed, falling back to PATH B (packed)");
-        }
-    }
-
-    // PATH B: packed-surface fallback.
-    // Left eye = top half (rows 0..H-1), right eye = bottom half (rows H..2H-1).
-    // The NVIDIA DDI hook in nvlddmkm.sys intercepts the StretchRect and routes
-    // each half to the correct stereo plane at full W×H resolution.
-    // SwapEyes=true in xr3dv.ini swaps the halves if eyes appear reversed.
+    // PATH B: packed-surface (always).
+    // SetActiveEye (PATH A) returns S_OK on 3DFM-patched 591.86 but silently
+    // writes both eyes to the same plane — useless.  The packed-surface DDI
+    // hook in nvlddmkm.sys correctly routes top-half -> left eye and
+    // bottom-half -> right eye at full W×H resolution on this driver build.
+    //
+    // Layout: left eye = rows [0, H), right eye = rows [H, 2H).
+    // SwapEyes=true in xr3dv.ini swaps if eyes appear reversed.
     if (!m_packedSysMem || !m_packedDefault) {
         LOG_ERROR("Packed surfaces not available"); return false;
     }
+
     ID3D11ShaderResourceView* topSRV = m_swapEyes ? rightSRV : leftSRV;
     ID3D11ShaderResourceView* botSRV = m_swapEyes ? leftSRV  : rightSRV;
     if (!BlitD3D11ToPacked(topSRV, d3d11Dev, 0,        m_stagingLeft))  return false;
@@ -571,8 +536,10 @@ bool NvapiStereoPresenter::PresentStereoFrame(
         auto* hdr = reinterpret_cast<NvStereoImageHeader*>(
             static_cast<uint8_t*>(lr.pBits) + (size_t)2 * m_height * lr.Pitch);
         hdr->signature = NVSTEREO_IMAGE_SIGNATURE;
-        hdr->width = m_width; hdr->height = m_height;
-        hdr->bpp   = 32;      hdr->flags  = 0u; // eye swap handled by topSRV/botSRV above
+        hdr->width     = m_width;
+        hdr->height    = m_height;
+        hdr->bpp       = 32;
+        hdr->flags     = 0u; // eye swap handled above via topSRV/botSRV
         m_packedSysMem->UnlockRect();
     }
 
