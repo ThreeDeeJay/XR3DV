@@ -4,24 +4,18 @@
 //
 //  Stereo presentation: FULLSCREEN-EXCLUSIVE D3D9Ex + NvAPI SetActiveEye.
 //
-//  Key invariant: D3D9 FSE device ALWAYS uses our own popup window (m_ownedHwnd),
-//  never the game's HWND. This is critical to prevent deadlock: CreateDeviceEx
-//  internally sends synchronous cross-thread messages to the device window's
-//  thread; if that thread is the game thread blocked in xrCreateSession waiting
-//  for m_initDone, it cannot pump messages and we deadlock. Our popup's WndProc
-//  runs on the msg thread, so no deadlock is possible.
+//  D3D9 FSE device uses the GAME'S OWN HWND — no separate popup window.
+//  The Init() loop pumps the calling thread's message queue while waiting for
+//  MsgThreadProc to complete, so CreateDeviceEx's internal synchronous
+//  cross-thread messages to the game HWND are dispatched without deadlock.
 //
-//  Audio fix: game window subclass swallows WM_ACTIVATE(INACTIVE),
-//  WM_ACTIVATEAPP(FALSE), WM_KILLFOCUS so the game never learns it "lost" focus.
+//  The game HWND as FSE window means Windows never sends WM_ACTIVATE(INACTIVE)
+//  or WM_KILLFOCUS to the game — it IS the active window — so audio and cursor
+//  work natively without any subclass tricks.  The subclass is kept only to
+//  handle WM_INPUT (Raw Input for mouse-look) and as a fallback deactivation
+//  filter for edge cases during FSE mode transitions.
 //
-//  Mouse-look: Raw Input (WM_INPUT) on the popup delivers relative mouse deltas
-//  without cursor interference. Deltas are accumulated in m_mouseDeltaX/Y and
-//  consumed each frame by Session::LocateViews to build the head pose. Middle
-//  mouse button sets m_recenterRequested.
-//
-//  Presentation paths (m_stereoActivated):
-//    PATH A — SetActiveEye (YES): routes via patched nvapi.dll (3DFM).
-//    PATH B — Packed surface (NO): routes via nvlddmkm.sys DDI hook (retail).
+//  Stereo presentation: side-by-side NV3D packed surface (0x4433564e).
 
 #include "pch.h"
 #include "nvapi_stereo.h"
@@ -49,6 +43,36 @@ static HWND    g_gameHwndSubclassed = nullptr;
 static LRESULT CALLBACK GameWndSubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_INPUT: {
+        // Handle Raw Input mouse for mouse-look before the game sees it.
+        NvapiStereoPresenter* p = g_presenterForInput;
+        if (p) {
+            UINT sz = 0;
+            GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
+                            RID_INPUT, nullptr, &sz, sizeof(RAWINPUTHEADER));
+            if (sz > 0 && sz <= 256) {
+                BYTE buf[256];
+                if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
+                                    RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
+                    const auto* ri = reinterpret_cast<const RAWINPUT*>(buf);
+                    if (ri->header.dwType == RIM_TYPEMOUSE &&
+                        (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                        p->m_mouseDeltaX.fetch_add(
+                            static_cast<int32_t>(ri->data.mouse.lLastX),
+                            std::memory_order_relaxed);
+                        p->m_mouseDeltaY.fetch_add(
+                            static_cast<int32_t>(ri->data.mouse.lLastY),
+                            std::memory_order_relaxed);
+                        if (ri->data.mouse.usButtonFlags &
+                                (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_3_DOWN))
+                            p->m_recenterRequested.store(true, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+        // Fall through to game's WndProc so it still gets its own Raw Input.
+        break;
+    }
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) {
             LOG_VERBOSE("Subclass: swallowed WM_ACTIVATE(INACTIVE)");
@@ -118,48 +142,8 @@ static HWND FindGameWindow(HWND excludeHwnd)
     return ctx.result;
 }
 
-// ---------------------------------------------------------------------------
-// Popup window procedure
-// Handles Raw Input (WM_INPUT) for mouse-look and hotkeys.
-// Input forwarding to game window is intentionally NOT done here —
-// games use Raw Input / DirectInput directly; WM_KEY* forwarding is redundant.
-// ---------------------------------------------------------------------------
+// g_presenterForInput: set before subclass is installed; read by subclass proc.
 static NvapiStereoPresenter* g_presenterForInput = nullptr;
-
-static LRESULT CALLBACK PopupWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-    case WM_INPUT: {
-        if (!g_presenterForInput) break;
-        UINT sz = 0;
-        GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
-                        RID_INPUT, nullptr, &sz, sizeof(RAWINPUTHEADER));
-        if (sz == 0 || sz > 256) break;
-        BYTE buf[256];
-        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
-                            RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) != sz)
-            break;
-        const auto* ri = reinterpret_cast<const RAWINPUT*>(buf);
-        if (ri->header.dwType == RIM_TYPEMOUSE &&
-            (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
-            // Accumulate relative mouse deltas (pixel units from driver)
-            g_presenterForInput->m_mouseDeltaX.fetch_add(
-                static_cast<int32_t>(ri->data.mouse.lLastX),
-                std::memory_order_relaxed);
-            g_presenterForInput->m_mouseDeltaY.fetch_add(
-                static_cast<int32_t>(ri->data.mouse.lLastY),
-                std::memory_order_relaxed);
-            // Middle button → recenter
-            if (ri->data.mouse.usButtonFlags &
-                    (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_3_DOWN))
-                g_presenterForInput->m_recenterRequested.store(
-                    true, std::memory_order_relaxed);
-        }
-        break;
-    }
-    }
-    return DefWindowProcW(hw, msg, wp, lp);
-}
 
 // ---------------------------------------------------------------------------
 // MsgThreadProc
@@ -182,39 +166,22 @@ void NvapiStereoPresenter::MsgThreadProc()
         LOG_INFO("Pre-FSE game window: not found yet (no in-process visible window)");
     }
 
-    // ---- 2. Create OUR OWN popup window for D3D9 ----
-    // We NEVER use the game HWND for D3D9 FSE. CreateDeviceEx sends internal
-    // SendMessage calls to the device window's thread. The game thread is
-    // currently blocked in Sleep() in Init(), so it cannot pump messages.
-    // Using our own popup (pumped by this thread) prevents that deadlock.
-    static const wchar_t kClass[] = L"XR3DV_Popup";
-    {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc); wc.lpfnWndProc = PopupWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass;
-        RegisterClassExW(&wc);
+    // ---- 2. Use game HWND as D3D9 FSE device window ----
+    // The Init() loop on the calling thread pumps its message queue, so
+    // CreateDeviceEx's internal SendMessage calls to the game HWND's thread
+    // (which IS the calling/game thread) are dispatched without deadlock.
+    // Using the game's own HWND means Windows never deactivates it — it IS
+    // the foreground window — so audio, cursor and input work natively.
+    if (!m_gameHwnd) {
+        LOG_ERROR("No game window found — cannot create FSE device");
+        m_initOk.store(false); m_initDone.store(true); return;
     }
+    m_hwnd = m_gameHwnd;
+    m_ownedHwnd = nullptr; // we do not own this window
+
+    // Register Raw Input on game HWND with RIDEV_INPUTSINK so WM_INPUT is
+    // delivered to GameWndSubclassProc even when another window has focus.
     g_presenterForInput = this;
-    m_ownedHwnd = CreateWindowExW(0, kClass, L"XR3DV", WS_POPUP | WS_VISIBLE,
-                                   0, 0, (int)m_width, (int)m_height,
-                                   nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!m_ownedHwnd) {
-        LOG_ERROR("CreateWindowEx failed GLE=%u", GetLastError());
-        RemoveGameSubclass(); m_initOk.store(false); m_initDone.store(true); return;
-    }
-    m_hwnd = m_ownedHwnd;
-    m_centerX = (int32_t)m_width  / 2;
-    m_centerY = (int32_t)m_height / 2;
-
-    SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, (int)m_width, (int)m_height,
-                 SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    ShowWindow(m_hwnd, SW_SHOWNORMAL);
-    BringWindowToTop(m_hwnd);
-    SetForegroundWindow(m_hwnd);
-    SetActiveWindow(m_hwnd);
-    SetFocus(m_hwnd);
-
-    // Register for Raw Input mouse so we get WM_INPUT regardless of focus
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
     rid.usUsage     = 0x02; // HID_USAGE_GENERIC_MOUSE
@@ -224,23 +191,7 @@ void NvapiStereoPresenter::MsgThreadProc()
         LOG_ERROR("RegisterRawInputDevices failed GLE=%u — mouse-look unavailable",
                   GetLastError());
 
-    // Hide cursor while XR3DV window is active; game cursor still shows when
-    // game window has foreground (which it will after subclass + no fights)
-    ShowCursor(FALSE);
-
-    {
-        MSG tmp;
-        for (int i = 0; i < 5; ++i) {
-            Sleep(20);
-            while (PeekMessageW(&tmp, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&tmp); DispatchMessageW(&tmp);
-            }
-        }
-    }
-    LOG_INFO("D3D9 window HWND=%p foreground=%s active=%s",
-             (void*)m_hwnd,
-             GetForegroundWindow() == m_hwnd ? "YES" : "NO",
-             GetActiveWindow()     == m_hwnd ? "YES" : "NO");
+    LOG_INFO("D3D9 device window: game HWND=%p", (void*)m_hwnd);
 
     // ---- 3. D3D9Ex ----
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
@@ -343,7 +294,7 @@ void NvapiStereoPresenter::MsgThreadProc()
 
     // ---- 7. Update game window post-FSE ----
     {
-        HWND found = FindGameWindow(m_hwnd);
+        HWND found = FindGameWindow(nullptr);
         if (found && found != m_gameHwnd) {
             LOG_INFO("Game window updated: %p -> %p", (void*)m_gameHwnd, (void*)found);
             RemoveGameSubclass();
@@ -447,7 +398,6 @@ void NvapiStereoPresenter::MsgThreadProc()
 done:
     KillTimer(nullptr, TIMER_INPUT_POLL);
     KillTimer(nullptr, TIMER_STEREO_SYNC);
-    ShowCursor(TRUE);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +709,7 @@ void NvapiStereoPresenter::SetConvergence(float val) {
 // ---------------------------------------------------------------------------
 NvapiStereoPresenter::~NvapiStereoPresenter() {
     m_initialised = false;
-    g_presenterForInput = nullptr;
+    g_presenterForInput = nullptr; // stop subclass from accumulating after destroy
     m_backBuffer.Reset();
     m_leftSurface.Reset();  m_rightSurface.Reset();
     m_sysMemLeft.Reset();   m_sysMemRight.Reset();
@@ -774,6 +724,7 @@ NvapiStereoPresenter::~NvapiStereoPresenter() {
     m_msgStop = true;
     if (m_msgThreadId) PostThreadMessageW(m_msgThreadId, WM_QUIT, 0, 0);
     if (m_msgThread.joinable()) m_msgThread.join();
+    // m_ownedHwnd is nullptr when using game HWND (we don't destroy it)
     if (m_ownedHwnd) { DestroyWindow(m_ownedHwnd); m_ownedHwnd = nullptr; }
     m_hwnd = nullptr;
     NvAPI_Unload();
