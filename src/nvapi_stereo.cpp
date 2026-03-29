@@ -512,49 +512,45 @@ bool NvapiStereoPresenter::PresentStereoFrame(
 {
     if (!m_initialised) return false;
 
-    // PATH B: packed-surface (always).
-    // SetActiveEye (PATH A) returns S_OK on 3DFM-patched 591.86 but silently
-    // writes both eyes to the same plane — useless.  The packed-surface DDI
-    // hook in nvlddmkm.sys correctly routes top-half -> left eye and
-    // bottom-half -> right eye at full W×H resolution on this driver build.
+    // Double-present: present left eye frame, then right eye frame.
     //
-    // Layout: left eye = rows [0, H), right eye = rows [H, 2H).
-    // SwapEyes=true in xr3dv.ini swaps if eyes appear reversed.
-    if (!m_packedSysMem || !m_packedDefault) {
-        LOG_ERROR("Packed surfaces not available"); return false;
-    }
+    // 3DV stereo on a 120Hz FSE device alternates which eye sees each frame:
+    //   even PresentEx calls -> left eye plane
+    //   odd  PresentEx calls -> right eye plane
+    //
+    // With HalfRate=true the XR frame loop runs at 60Hz. Each xrEndFrame
+    // calls us once. We do TWO PresentEx calls, consuming two 120Hz vblanks
+    // (2 x 8.3ms = 16.7ms = 60Hz).  D3DPRESENT_INTERVAL_ONE (set at device
+    // creation) blocks each PresentEx until its vblank so timing is automatic.
+    //
+    // SwapEyes=true in xr3dv.ini swaps the presentation order if eyes appear
+    // reversed (which eye is "even" depends on the first present after activation).
 
-    ID3D11ShaderResourceView* topSRV = m_swapEyes ? rightSRV : leftSRV;
-    ID3D11ShaderResourceView* botSRV = m_swapEyes ? leftSRV  : rightSRV;
-    if (!BlitD3D11ToPacked(topSRV, d3d11Dev, 0,        m_stagingLeft))  return false;
-    if (!BlitD3D11ToPacked(botSRV, d3d11Dev, m_height, m_stagingRight)) return false;
+    auto* firstSRV  = m_swapEyes ? rightSRV : leftSRV;
+    auto* secondSRV = m_swapEyes ? leftSRV  : rightSRV;
+    auto* firstSurf  = m_swapEyes ? m_rightSurface.Get() : m_leftSurface.Get();
+    auto* secondSurf = m_swapEyes ? m_leftSurface.Get()  : m_rightSurface.Get();
+    auto& firstStage  = m_swapEyes ? m_stagingRight : m_stagingLeft;
+    auto& secondStage = m_swapEyes ? m_stagingLeft  : m_stagingRight;
+    auto& firstSysMem  = m_swapEyes ? m_sysMemRight : m_sysMemLeft;
+    auto& secondSysMem = m_swapEyes ? m_sysMemLeft  : m_sysMemRight;
 
-    {
-        D3DLOCKED_RECT lr{};
-        HRESULT h = m_packedSysMem->LockRect(&lr, nullptr, 0);
-        if (FAILED(h)) { LOG_ERROR("LockRect (header) 0x%08X", h); return false; }
-        auto* hdr = reinterpret_cast<NvStereoImageHeader*>(
-            static_cast<uint8_t*>(lr.pBits) + (size_t)2 * m_height * lr.Pitch);
-        hdr->signature = NVSTEREO_IMAGE_SIGNATURE;
-        hdr->width     = m_width;
-        hdr->height    = m_height;
-        hdr->bpp       = 32;
-        hdr->flags     = 0u; // eye swap handled above via topSRV/botSRV
-        m_packedSysMem->UnlockRect();
-    }
-
-    HRESULT h = m_device->UpdateSurface(
-        m_packedSysMem.Get(), nullptr, m_packedDefault.Get(), nullptr);
-    if (FAILED(h)) { LOG_ERROR("UpdateSurface 0x%08X", h); return false; }
-
-    RECT src{ 0, 0, (LONG)m_width, (LONG)(m_height * 2 + 1) };
-    RECT dst{ 0, 0, (LONG)m_width, (LONG)m_height };
-    h = m_device->StretchRect(
-        m_packedDefault.Get(), &src, m_backBuffer.Get(), &dst, D3DTEXF_POINT);
-    if (FAILED(h)) { LOG_ERROR("StretchRect (packed) 0x%08X", h); return false; }
-
+    // --- First eye (even frame) ---
+    if (!BlitD3D11ToSurface(firstSRV, d3d11Dev, firstSurf, firstStage, firstSysMem))
+        return false;
+    HRESULT h = m_device->StretchRect(firstSurf,  nullptr, m_backBuffer.Get(), nullptr, D3DTEXF_NONE);
+    if (FAILED(h)) { LOG_ERROR("StretchRect (eye 0) 0x%08X", h); return false; }
     h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-    if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
+    if (FAILED(h)) { LOG_ERROR("PresentEx (eye 0) 0x%08X", h); return false; }
+
+    // --- Second eye (odd frame) ---
+    if (!BlitD3D11ToSurface(secondSRV, d3d11Dev, secondSurf, secondStage, secondSysMem))
+        return false;
+    h = m_device->StretchRect(secondSurf, nullptr, m_backBuffer.Get(), nullptr, D3DTEXF_NONE);
+    if (FAILED(h)) { LOG_ERROR("StretchRect (eye 1) 0x%08X", h); return false; }
+    h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+    if (FAILED(h)) { LOG_ERROR("PresentEx (eye 1) 0x%08X", h); return false; }
+
     return true;
 }
 
