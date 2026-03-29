@@ -16,7 +16,7 @@
 
 namespace xr3dv {
 
-#define NVSTEREO_IMAGE_SIGNATURE 0x4433445C
+#define NVSTEREO_IMAGE_SIGNATURE 0x4433564e
 struct NvStereoImageHeader {
     DWORD signature;
     DWORD width;

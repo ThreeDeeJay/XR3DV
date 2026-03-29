@@ -319,21 +319,27 @@ void NvapiStereoPresenter::MsgThreadProc()
     if (FAILED(hr))
         LOG_ERROR("CreateOffscreenPlainSurface (per-eye) failed: 0x%08X", hr);
 
-    const UINT ph = m_height * 2 + 1;
-    hr  = m_device->CreateOffscreenPlainSurface(m_width, ph, D3DFMT_X8R8G8B8,
+    // Side-by-side packed stereo surface: 2W × (H+1).
+    // The extra row at index H holds the NVSTEREOIMAGEHEADER.
+    // The NVIDIA DDI hook reads the NV3D signature and routes the
+    // left half (x=[0,W)) to the left stereo plane and the right
+    // half (x=[W,2W)) to the right stereo plane.
+    const UINT pw = m_width * 2;          // surface width = 2x eye width
+    const UINT ph = m_height + 1;         // surface height = eye height + header row
+    hr  = m_device->CreateOffscreenPlainSurface(pw, ph, D3DFMT_X8R8G8B8,
                                                  D3DPOOL_SYSTEMMEM, &m_packedSysMem,  nullptr);
-    hr |= m_device->CreateOffscreenPlainSurface(m_width, ph, D3DFMT_X8R8G8B8,
+    hr |= m_device->CreateOffscreenPlainSurface(pw, ph, D3DFMT_X8R8G8B8,
                                                  D3DPOOL_DEFAULT,   &m_packedDefault, nullptr);
     if (FAILED(hr))
-        LOG_ERROR("CreateOffscreenPlainSurface (packed) failed: 0x%08X", hr);
+        LOG_ERROR("CreateOffscreenPlainSurface (packed %ux%u) failed: 0x%08X", pw, ph, hr);
 
     hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBuffer);
     if (FAILED(hr)) {
         LOG_ERROR("GetBackBuffer failed: 0x%08X", hr);
         RemoveGameSubclass(); m_initOk.store(false); m_initDone.store(true); return;
     }
-    LOG_INFO("Stereo surfaces ready: per-eye %ux%u  packed %ux%u",
-             m_width, m_height, m_width, ph);
+    LOG_INFO("Stereo surfaces ready: side-by-side %ux%u (each eye %ux%u)",
+             pw, ph, m_width, m_height);
 
     // ---- 7. Update game window post-FSE ----
     {
@@ -511,46 +517,116 @@ bool NvapiStereoPresenter::PresentStereoFrame(
     ID3D11Device*             d3d11Dev)
 {
     if (!m_initialised) return false;
+    if (!m_packedSysMem || !m_packedDefault) {
+        LOG_ERROR("Packed surfaces not available"); return false;
+    }
 
-    // Double-present: present left eye frame, then right eye frame.
+    // Side-by-side packed stereo presentation (sView / NVIDIA reference technique).
     //
-    // 3DV stereo on a 120Hz FSE device alternates which eye sees each frame:
-    //   even PresentEx calls -> left eye plane
-    //   odd  PresentEx calls -> right eye plane
+    // Surface layout: 2W × (H+1)
+    //   rows [0, H): left eye in columns [0,W), right eye in columns [W,2W)
+    //   row H:       NVSTEREOIMAGEHEADER  (signature 0x4433564e = "NV3D")
     //
-    // With HalfRate=true the XR frame loop runs at 60Hz. Each xrEndFrame
-    // calls us once. We do TWO PresentEx calls, consuming two 120Hz vblanks
-    // (2 x 8.3ms = 16.7ms = 60Hz).  D3DPRESENT_INTERVAL_ONE (set at device
-    // creation) blocks each PresentEx until its vblank so timing is automatic.
+    // StretchRect 2W×H → W×H backbuffer.  The NVIDIA DDI hook in nvlddmkm.sys
+    // reads the NV3D signature and routes each half to the correct stereo plane
+    // at full W×H resolution — no TAB scaling involved.
     //
-    // SwapEyes=true in xr3dv.ini swaps the presentation order if eyes appear
-    // reversed (which eye is "even" depends on the first present after activation).
+    // SwapEyes=true in xr3dv.ini uses the SIH_SWAP_EYES header flag to swap
+    // which half the driver assigns to each eye.
 
-    auto* firstSRV  = m_swapEyes ? rightSRV : leftSRV;
-    auto* secondSRV = m_swapEyes ? leftSRV  : rightSRV;
-    auto* firstSurf  = m_swapEyes ? m_rightSurface.Get() : m_leftSurface.Get();
-    auto* secondSurf = m_swapEyes ? m_leftSurface.Get()  : m_rightSurface.Get();
-    auto& firstStage  = m_swapEyes ? m_stagingRight : m_stagingLeft;
-    auto& secondStage = m_swapEyes ? m_stagingLeft  : m_stagingRight;
-    auto& firstSysMem  = m_swapEyes ? m_sysMemRight : m_sysMemLeft;
-    auto& secondSysMem = m_swapEyes ? m_sysMemLeft  : m_sysMemRight;
+    ID3D11ShaderResourceView* eyeL = m_swapEyes ? rightSRV : leftSRV;
+    ID3D11ShaderResourceView* eyeR = m_swapEyes ? leftSRV  : rightSRV;
 
-    // --- First eye (even frame) ---
-    if (!BlitD3D11ToSurface(firstSRV, d3d11Dev, firstSurf, firstStage, firstSysMem))
-        return false;
-    HRESULT h = m_device->StretchRect(firstSurf,  nullptr, m_backBuffer.Get(), nullptr, D3DTEXF_NONE);
-    if (FAILED(h)) { LOG_ERROR("StretchRect (eye 0) 0x%08X", h); return false; }
+    // --- Stage both eyes from D3D11 ---
+    auto stageSRV = [&](ID3D11ShaderResourceView* srv,
+                        ComPtr<ID3D11Texture2D>&  staging) -> bool {
+        ComPtr<ID3D11Resource> res; srv->GetResource(&res);
+        ComPtr<ID3D11Texture2D> src;
+        if (FAILED(res.As(&src))) { LOG_ERROR("SRV not Texture2D"); return false; }
+        D3D11_TEXTURE2D_DESC sd{}; src->GetDesc(&sd);
+        if (!staging || m_stagingWidth != sd.Width ||
+            m_stagingHeight != sd.Height || m_stagingFormat != sd.Format) {
+            staging.Reset();
+            m_stagingWidth = sd.Width; m_stagingHeight = sd.Height;
+            m_stagingFormat = sd.Format;
+            D3D11_TEXTURE2D_DESC st{};
+            st.Width = sd.Width; st.Height = sd.Height;
+            st.MipLevels = 1; st.ArraySize = 1; st.Format = sd.Format;
+            st.SampleDesc = {1,0}; st.Usage = D3D11_USAGE_STAGING;
+            st.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(d3d11Dev->CreateTexture2D(&st, nullptr, &staging))) {
+                LOG_ERROR("CreateTexture2D (staging) failed"); return false;
+            }
+            LOG_VERBOSE("Staging texture (re)created: %ux%u fmt=%u",
+                        sd.Width, sd.Height, (unsigned)sd.Format);
+        }
+        ComPtr<ID3D11DeviceContext> ctx; d3d11Dev->GetImmediateContext(&ctx);
+        ctx->CopyResource(staging.Get(), src.Get());
+        return true;
+    };
+    if (!stageSRV(eyeL, m_stagingLeft))  return false;
+    if (!stageSRV(eyeR, m_stagingRight)) return false;
+
+    // --- Lock stereo SYSMEM surface and write both halves ---
+    D3DLOCKED_RECT lr{};
+    HRESULT h = m_packedSysMem->LockRect(&lr, nullptr, 0);
+    if (FAILED(h)) { LOG_ERROR("LockRect (stereo) 0x%08X", h); return false; }
+
+    ComPtr<ID3D11DeviceContext> ctx; d3d11Dev->GetImmediateContext(&ctx);
+    const size_t rowBytes = (size_t)m_stagingWidth * 4; // bytes per eye per row
+    const size_t xOffR    = rowBytes;                   // right half byte offset
+
+    // Left eye → left half (x=0)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(ctx->Map(m_stagingLeft.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+            uint8_t*       dst = static_cast<uint8_t*>(lr.pBits);
+            for (uint32_t row = 0; row < m_stagingHeight; ++row)
+                memcpy(dst + (size_t)row * lr.Pitch,
+                       src + (size_t)row * mapped.RowPitch, rowBytes);
+            ctx->Unmap(m_stagingLeft.Get(), 0);
+        } else { m_packedSysMem->UnlockRect(); LOG_ERROR("Map (left) failed"); return false; }
+    }
+
+    // Right eye → right half (x=W)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(ctx->Map(m_stagingRight.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+            uint8_t*       dst = static_cast<uint8_t*>(lr.pBits);
+            for (uint32_t row = 0; row < m_stagingHeight; ++row)
+                memcpy(dst + (size_t)row * lr.Pitch + xOffR,
+                       src + (size_t)row * mapped.RowPitch, rowBytes);
+            ctx->Unmap(m_stagingRight.Get(), 0);
+        } else { m_packedSysMem->UnlockRect(); LOG_ERROR("Map (right) failed"); return false; }
+    }
+
+    // Write NVSTEREOIMAGEHEADER at row H (the extra row beyond the image data)
+    {
+        auto* hdr = reinterpret_cast<NvStereoImageHeader*>(
+            static_cast<uint8_t*>(lr.pBits) + (size_t)m_stagingHeight * lr.Pitch);
+        hdr->signature = NVSTEREO_IMAGE_SIGNATURE; // 0x4433564e = "NV3D"
+        hdr->width     = m_stagingWidth * 2;       // full side-by-side width
+        hdr->height    = m_stagingHeight;
+        hdr->bpp       = 32;
+        hdr->flags     = 0u; // eye swap handled above via eyeL/eyeR assignment
+    }
+    m_packedSysMem->UnlockRect();
+
+    // Upload SYSMEM → DEFAULT
+    h = m_device->UpdateSurface(m_packedSysMem.Get(), nullptr, m_packedDefault.Get(), nullptr);
+    if (FAILED(h)) { LOG_ERROR("UpdateSurface 0x%08X", h); return false; }
+
+    // StretchRect 2W×H → W×H backbuffer (DDI hook intercepts and routes to stereo planes)
+    RECT src{ 0, 0, (LONG)(m_stagingWidth * 2), (LONG)m_stagingHeight };
+    RECT dst{ 0, 0, (LONG)m_stagingWidth,        (LONG)m_stagingHeight };
+    h = m_device->StretchRect(m_packedDefault.Get(), &src,
+                               m_backBuffer.Get(),    &dst, D3DTEXF_LINEAR);
+    if (FAILED(h)) { LOG_ERROR("StretchRect (stereo) 0x%08X", h); return false; }
+
     h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-    if (FAILED(h)) { LOG_ERROR("PresentEx (eye 0) 0x%08X", h); return false; }
-
-    // --- Second eye (odd frame) ---
-    if (!BlitD3D11ToSurface(secondSRV, d3d11Dev, secondSurf, secondStage, secondSysMem))
-        return false;
-    h = m_device->StretchRect(secondSurf, nullptr, m_backBuffer.Get(), nullptr, D3DTEXF_NONE);
-    if (FAILED(h)) { LOG_ERROR("StretchRect (eye 1) 0x%08X", h); return false; }
-    h = m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-    if (FAILED(h)) { LOG_ERROR("PresentEx (eye 1) 0x%08X", h); return false; }
-
+    if (FAILED(h)) { LOG_ERROR("PresentEx 0x%08X", h); return false; }
     return true;
 }
 
