@@ -23,18 +23,24 @@
 
 namespace xr3dv {
 
+enum class GraphicsApi { D3D11, D3D12 };
+
 /// Represents a single XrSession (one application connection).
 class Session {
 public:
     explicit Session(Config& cfg);
     ~Session();
 
-    // Non-copyable
     Session(const Session&)            = delete;
     Session& operator=(const Session&) = delete;
 
-    /// Initialise from XR_KHR_D3D11_enable binding info.
+    /// Initialise from XR_KHR_D3D11_enable binding.
     XrResult InitD3D11(const XrGraphicsBindingD3D11KHR* binding);
+
+    /// Initialise from XR_KHR_D3D12_enable binding.
+    /// Creates an internal D3D11 device; swapchain textures are shared with
+    /// the app's D3D12 device via NT shared handles.
+    XrResult InitD3D12(void* d3d12Device, void* d3d12Queue);
 
     // ---------- Lifecycle -------------------------------------------------
     XrResult Begin(const XrSessionBeginInfo* bi);
@@ -75,10 +81,15 @@ private:
 
     Config&                      m_cfg;
     std::atomic<XrSessionState>  m_state{XR_SESSION_STATE_IDLE};
+    GraphicsApi                  m_graphicsApi{GraphicsApi::D3D11};
 
-    // D3D11 device provided by the application
+    // D3D11 device — always valid (provided by app for D3D11, created
+    // internally for D3D12 so swapchain SRVs work for our presenter)
     Microsoft::WRL::ComPtr<ID3D11Device>        m_d3d11Dev;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_d3d11Ctx;
+
+    // D3D12 mode: app's device used to open shared texture handles
+    void* m_d3d12Device = nullptr; // ID3D12Device* (raw, app owns lifetime)
 
     // Stereo presenter — windowed D3D9 + packed stereo surface approach
     NvapiStereoPresenter m_presenter;

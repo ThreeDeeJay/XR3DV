@@ -168,21 +168,47 @@ void NvapiStereoPresenter::MsgThreadProc()
         LOG_INFO("Pre-FSE game window: not found yet (no in-process visible window)");
     }
 
-    // ---- 2. Use game HWND as D3D9 FSE device window ----
-    // The Init() loop on the calling thread pumps its message queue, so
-    // CreateDeviceEx's internal SendMessage calls to the game HWND's thread
-    // (which IS the calling/game thread) are dispatched without deadlock.
-    // Using the game's own HWND means Windows never deactivates it — it IS
-    // the foreground window — so audio, cursor and input work natively.
-    if (!m_gameHwnd) {
-        LOG_ERROR("No game window found — cannot create FSE device");
-        m_initOk.store(false); m_initDone.store(true); return;
+    // ---- 2. Choose D3D9 device window ----
+    // Primary: game's own HWND — audio/cursor/input work natively since the
+    // game window IS the foreground window. The Init() pump loop dispatches
+    // any synchronous cross-thread messages from CreateDeviceEx safely.
+    // Fallback: our own popup window for apps with no visible window at
+    // session time (xr3dv_diag, hello_xr, headless test tools).
+    if (m_gameHwnd) {
+        m_hwnd      = m_gameHwnd;
+        m_ownedHwnd = nullptr; // we do not own this window
+    } else {
+        LOG_INFO("No game window found — creating popup fallback for D3D9 FSE");
+        static const wchar_t kClass[] = L"XR3DV_Popup";
+        {
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc); wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass;
+            RegisterClassExW(&wc); // idempotent
+        }
+        m_ownedHwnd = CreateWindowExW(0, kClass, L"XR3DV", WS_POPUP | WS_VISIBLE,
+                                       0, 0, (int)m_width, (int)m_height,
+                                       nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!m_ownedHwnd) {
+            LOG_ERROR("CreateWindowEx (popup) failed GLE=%u", GetLastError());
+            RemoveGameSubclass(); m_initOk.store(false); m_initDone.store(true); return;
+        }
+        SetWindowPos(m_ownedHwnd, HWND_TOPMOST, 0, 0, (int)m_width, (int)m_height,
+                     SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        ShowWindow(m_ownedHwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(m_ownedHwnd);
+        MSG tmp; for (int i = 0; i < 3; ++i) {
+            Sleep(20);
+            while (PeekMessageW(&tmp, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&tmp); DispatchMessageW(&tmp);
+            }
+        }
+        m_hwnd = m_ownedHwnd;
     }
-    m_hwnd = m_gameHwnd;
-    m_ownedHwnd = nullptr; // we do not own this window
 
-    // Register Raw Input on game HWND with RIDEV_INPUTSINK so WM_INPUT is
-    // delivered to GameWndSubclassProc even when another window has focus.
+    // Register Raw Input (RIDEV_INPUTSINK = receive even when not foreground).
+    // On the popup path Raw Input goes to PopupWndProc (default proc ignores it,
+    // deltas stay zero — mouse-look just won't work for windowless apps).
     g_presenterForInput = this;
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
@@ -193,7 +219,8 @@ void NvapiStereoPresenter::MsgThreadProc()
         LOG_ERROR("RegisterRawInputDevices failed GLE=%u — mouse-look unavailable",
                   GetLastError());
 
-    LOG_INFO("D3D9 device window: game HWND=%p", (void*)m_hwnd);
+    LOG_INFO("D3D9 device window: %p (%s)",
+             (void*)m_hwnd, m_ownedHwnd ? "popup fallback" : "game HWND");
 
     // ---- 3. D3D9Ex ----
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);

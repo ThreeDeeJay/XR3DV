@@ -5,6 +5,7 @@
 #include "pch.h"
 #include "session.h"
 #include "logging.h"
+#include <d3d12.h>   // ID3D12Device — COM vtable only, no d3d12.lib required
 
 namespace xr3dv {
 
@@ -65,7 +66,40 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
 }
 
 // ---------------------------------------------------------------------------
-void Session::PollConfigThread() {
+XrResult Session::InitD3D12(void* d3d12DeviceRaw, void* /*d3d12QueueRaw*/)
+{
+    if (!d3d12DeviceRaw) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+    m_graphicsApi  = GraphicsApi::D3D12;
+    m_d3d12Device  = d3d12DeviceRaw;
+
+    // Create our own D3D11 device on the same adapter.
+    // Swapchain::InitShared will create NT-shared textures so the app's D3D12
+    // device can render into them while we read them back via D3D11 SRVs.
+    D3D_FEATURE_LEVEL fl{};
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                    0, nullptr, 0, D3D11_SDK_VERSION,
+                                    &m_d3d11Dev, &fl, &m_d3d11Ctx);
+    if (FAILED(hr)) {
+        LOG_ERROR("InitD3D12: D3D11CreateDevice failed 0x%08X", (unsigned)hr);
+        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+    }
+    LOG_INFO("InitD3D12: internal D3D11 device fl=0x%04X", (unsigned)fl);
+
+    if (!m_presenter.Init(m_cfg.width, m_cfg.height, m_cfg.monitorRate,
+                           m_cfg.separation.load(), m_cfg.convergence.load(),
+                           m_cfg.swapEyes, m_cfg.gameIniPath)) {
+        LOG_ERROR("InitD3D12: failed to initialise NvapiStereoPresenter");
+        return XR_ERROR_INITIALIZATION_FAILED;
+    }
+
+    m_timer.SetTargetHz(m_cfg.frameRate);
+    m_pollThread = std::thread([this]{ PollConfigThread(); });
+    m_state = XR_SESSION_STATE_READY;
+    LOG_INFO("Session initialised (D3D12 → shared D3D11)");
+    return XR_SUCCESS;
+}
+
+// --------------------------------------------------------------------------- {
     while (!m_pollStop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         bool changed = PollConfigReload(m_cfg);
@@ -239,8 +273,14 @@ XrResult Session::CreateSwapchain(const XrSwapchainCreateInfo* ci,
                                    XrSwapchain*                 out)
 {
     auto sc = std::make_unique<Swapchain>();
-    if (!sc->Init(m_d3d11Dev.Get(), *ci))
-        return XR_ERROR_RUNTIME_FAILURE;
+    bool ok;
+    if (m_graphicsApi == GraphicsApi::D3D12 && m_d3d12Device) {
+        ok = sc->InitShared(m_d3d11Dev.Get(),
+                            static_cast<ID3D12Device*>(m_d3d12Device), *ci);
+    } else {
+        ok = sc->Init(m_d3d11Dev.Get(), *ci);
+    }
+    if (!ok) return XR_ERROR_RUNTIME_FAILURE;
 
     std::lock_guard<std::mutex> lk(m_scMtx);
     uint64_t h = m_nextScHandle++;

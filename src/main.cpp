@@ -19,9 +19,31 @@
 // We deliberately avoid including d3d12.h / vulkan.h / GL headers — XR3DV
 // only presents via D3D11. These structs match the OpenXR spec layout exactly.
 // ---------------------------------------------------------------------------
-#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR
-#  define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR  ((XrStructureType)1000028001)
+#ifndef XR_TYPE_GRAPHICS_BINDING_D3D12_KHR
+#  define XR_TYPE_GRAPHICS_BINDING_D3D12_KHR    ((XrStructureType)1000028000)
 #endif
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR
+#  define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR ((XrStructureType)1000028001)
+#endif
+#ifndef XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR
+#  define XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR     ((XrStructureType)1000028002)
+#endif
+
+// D3D12 binding — void* for device/queue avoids pulling in d3d12.h here
+// (Session.cpp includes d3d12.h and casts appropriately)
+typedef struct XrGraphicsBindingD3D12KHR {
+    XrStructureType type;
+    void*           next;
+    void*           device;  // ID3D12Device*
+    void*           queue;   // ID3D12CommandQueue*
+} XrGraphicsBindingD3D12KHR;
+
+typedef struct XrSwapchainImageD3D12KHR {
+    XrStructureType type;
+    void*           next;
+    void*           texture; // ID3D12Resource*
+} XrSwapchainImageD3D12KHR;
+
 typedef struct XrGraphicsRequirementsD3D12KHR {
     XrStructureType   type;
     void*             next;
@@ -521,36 +543,39 @@ xrCreateSession(XrInstance /*instance*/,
     xr3dv::Runtime* rt = xr3dv::GetRuntime();
     if (!rt) return XR_ERROR_RUNTIME_FAILURE;
 
-    // Find D3D11 graphics binding in the next chain
-    const XrGraphicsBindingD3D11KHR* binding = nullptr;
+    // Scan the next chain for a supported graphics binding
+    const XrGraphicsBindingD3D11KHR* d3d11Binding = nullptr;
+    const XrGraphicsBindingD3D12KHR* d3d12Binding = nullptr;
     const XrBaseInStructure* next =
         reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
     while (next) {
-        if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
-            binding = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(next);
-            break;
-        }
+        if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR)
+            d3d11Binding = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(next);
+        else if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR)
+            d3d12Binding = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(next);
         next = next->next;
     }
 
-    if (!binding) {
-        // Walk chain once more to log what binding type was actually provided
+    auto sess = std::make_unique<xr3dv::Session>(rt->cfg);
+    XrResult res = XR_ERROR_GRAPHICS_DEVICE_INVALID;
+
+    if (d3d11Binding) {
+        res = sess->InitD3D11(d3d11Binding);
+    } else if (d3d12Binding) {
+        res = sess->InitD3D12(d3d12Binding->device, d3d12Binding->queue);
+    } else {
+        // Log what binding types were actually provided
         const XrBaseInStructure* n2 =
             reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
         while (n2) {
-            LOG_ERROR("xrCreateSession: unsupported graphics binding type %d "
-                      "(XR3DV only supports XR_KHR_D3D11_enable for rendering; "
-                      "Vulkan/D3D12/OpenGL apps must use D3D11 interop or "
-                      "will fail here)", (int)n2->type);
+            LOG_ERROR("xrCreateSession: unsupported binding type %d "
+                      "(XR3DV supports D3D11 natively, D3D12 via shared textures; "
+                      "Vulkan/OpenGL not yet supported)", (int)n2->type);
             n2 = n2->next;
         }
         if (!createInfo->next)
-            LOG_ERROR("xrCreateSession: no graphics binding provided");
-        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            LOG_ERROR("xrCreateSession: no graphics binding in next chain");
     }
-
-    auto sess = std::make_unique<xr3dv::Session>(rt->cfg);
-    XrResult res = sess->InitD3D11(binding);
     if (res != XR_SUCCESS) return res;
 
     std::lock_guard<std::mutex> lk(rt->sessionMtx);
@@ -707,11 +732,22 @@ xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t cap, uint32_t* count,
     if (cap == 0) return XR_SUCCESS;
     if (cap < n)  return XR_ERROR_SIZE_INSUFFICIENT;
 
-    auto* d3d11Images = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
-    for (uint32_t i = 0; i < n; ++i) {
-        d3d11Images[i].type    = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
-        d3d11Images[i].next    = nullptr;
-        d3d11Images[i].texture = sc->Images()[i].tex.Get();
+    // The app fills images[0].type before calling; check it to return the
+    // correct resource type. Default to D3D11 for unrecognised types.
+    if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) {
+        auto* d3d12Images = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            d3d12Images[i].type    = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+            d3d12Images[i].next    = nullptr;
+            d3d12Images[i].texture = sc->Images()[i].d3d12Tex.Get();
+        }
+    } else {
+        auto* d3d11Images = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            d3d11Images[i].type    = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+            d3d11Images[i].next    = nullptr;
+            d3d11Images[i].texture = sc->Images()[i].tex.Get();
+        }
     }
     return XR_SUCCESS;
 }
