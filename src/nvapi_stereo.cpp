@@ -40,6 +40,9 @@ static constexpr UINT WM_XR3DV_RETRY_ACTIVATE = WM_APP + 1;
 static WNDPROC g_origGameWndProc    = nullptr;
 static HWND    g_gameHwndSubclassed = nullptr;
 
+// Set before subclass is installed; read by GameWndSubclassProc for Raw Input.
+static NvapiStereoPresenter* g_presenterForInput = nullptr;
+
 static LRESULT CALLBACK GameWndSubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -142,8 +145,7 @@ static HWND FindGameWindow(HWND excludeHwnd)
     return ctx.result;
 }
 
-// g_presenterForInput: set before subclass is installed; read by subclass proc.
-static NvapiStereoPresenter* g_presenterForInput = nullptr;
+// g_presenterForInput declared near top of file, before GameWndSubclassProc.
 
 // ---------------------------------------------------------------------------
 // MsgThreadProc
