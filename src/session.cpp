@@ -99,7 +99,8 @@ XrResult Session::InitD3D12(void* d3d12DeviceRaw, void* /*d3d12QueueRaw*/)
     return XR_SUCCESS;
 }
 
-// --------------------------------------------------------------------------- {
+// ---------------------------------------------------------------------------
+void Session::PollConfigThread() {
     while (!m_pollStop) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         bool changed = PollConfigReload(m_cfg);
