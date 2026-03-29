@@ -15,6 +15,41 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
+// Minimal OpenXR graphics-binding structs for extension stubs.
+// We deliberately avoid including d3d12.h / vulkan.h / GL headers — XR3DV
+// only presents via D3D11. These structs match the OpenXR spec layout exactly.
+// ---------------------------------------------------------------------------
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR
+#  define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR  ((XrStructureType)1000028001)
+#endif
+typedef struct XrGraphicsRequirementsD3D12KHR {
+    XrStructureType   type;
+    void*             next;
+    LUID              adapterLuid;       // from windows.h, already included
+    D3D_FEATURE_LEVEL minFeatureLevel;   // from d3dcommon.h via d3d11.h
+} XrGraphicsRequirementsD3D12KHR;
+
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR
+#  define XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR  ((XrStructureType)1000023001)
+#endif
+typedef struct XrGraphicsRequirementsOpenGLKHR {
+    XrStructureType type;
+    void*           next;
+    XrVersion       minApiVersionSupported;
+    XrVersion       maxApiVersionSupported;
+} XrGraphicsRequirementsOpenGLKHR;
+
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR
+#  define XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR  ((XrStructureType)1000025001)
+#endif
+typedef struct XrGraphicsRequirementsVulkanKHR {
+    XrStructureType type;
+    void*           next;
+    XrVersion       minApiVersionSupported;
+    XrVersion       maxApiVersionSupported;
+} XrGraphicsRequirementsVulkanKHR;
+
+// ---------------------------------------------------------------------------
 // Loader negotiation — first function the loader calls
 // ---------------------------------------------------------------------------
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
