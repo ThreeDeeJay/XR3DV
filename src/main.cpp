@@ -51,15 +51,22 @@ xrNegotiateLoaderRuntimeInterface(
 // ---------------------------------------------------------------------------
 struct ExtensionEntry { const char* name; uint32_t version; };
 static const ExtensionEntry kSupportedExtensions[] = {
-    // Graphics binding — required
+    // Graphics bindings — D3D11 is native; others are stubs that return the
+    // same adapter LUID. Apps that merely check extension presence at startup
+    // (and use D3D11 anyway) will work. Apps that actually bind Vulkan/GL/D3D12
+    // will get XR_ERROR_GRAPHICS_DEVICE_INVALID from xrCreateSession.
     { "XR_KHR_D3D11_enable",                         1 },
-    // Depth layer — we accept (and ignore) depth swapchains, matching real runtimes
+    { "XR_KHR_D3D12_enable",                         9 },
+    { "XR_KHR_opengl_enable",                        10 },
+    { "XR_KHR_vulkan_enable",                         8 },
+    { "XR_KHR_vulkan_enable2",                        2 },
+    // Depth layer — accept and ignore depth swapchains
     { "XR_KHR_composition_layer_depth",               6 },
-    // Debug utils — stub: xrCreateDebugUtilsMessengerEXT returns SUCCESS
+    // Debug utils — stub
     { "XR_EXT_debug_utils",                           5 },
-    // Win32 time conversion — trivial: QPC ↔ XrTime are the same unit here
+    // Win32 time conversion — QPC == XrTime in this runtime
     { "XR_KHR_win32_convert_performance_counter_time", 1 },
-    // Visibility mask — stub: returns empty mesh (no occlusion mask for 3DV)
+    // Visibility mask — stub: returns empty mesh
     { "XR_KHR_visibility_mask",                       2 },
 };
 static const uint32_t kSupportedExtCount =
@@ -319,69 +326,153 @@ xrEnumerateViewConfigurationViews(XrInstance /*instance*/, XrSystemId /*systemId
 // ---------------------------------------------------------------------------
 // D3D11 graphics requirements (XR_KHR_D3D11_enable)
 // ---------------------------------------------------------------------------
+// Helper: get the default GPU's LUID and feature level via a throwaway D3D11 device.
+static bool GetDefaultAdapterLUID(LUID& luid, D3D_FEATURE_LEVEL& fl)
+{
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                    nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                                    &dev, &fl, nullptr);
+    if (FAILED(hr)) return false;
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
+    if (FAILED(dev.As(&dxgiDev))) return false;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgiDev->GetAdapter(&adapter))) return false;
+    DXGI_ADAPTER_DESC desc{};
+    if (FAILED(adapter->GetDesc(&desc))) return false;
+    luid = desc.AdapterLuid;
+    LOG_INFO("Default GPU: '%ls' LUID={%08X,%08X} fl=0x%04X",
+             desc.Description, (unsigned)luid.HighPart, (unsigned)luid.LowPart, (unsigned)fl);
+    return true;
+}
+
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL
 xrGetD3D11GraphicsRequirementsKHR(XrInstance /*instance*/,
                                    XrSystemId /*systemId*/,
                                    XrGraphicsRequirementsD3D11KHR* req)
 {
-    req->type            = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
+    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
     req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
-    req->adapterLuid     = {};  // overwritten below
-
-    // Canonical approach: create a throwaway D3D11 device on the default
-    // hardware adapter, then walk D3D11Device → IDXGIDevice → IDXGIAdapter
-    // to read back the exact LUID that was selected.
-    // This avoids having to enumerate adapters ourselves and correctly handles
-    // systems with multiple GPUs (Windows picks the same adapter it will
-    // give back when the app calls D3D11CreateDevice with our LUID).
-    {
-        D3D_FEATURE_LEVEL fl;
-        Microsoft::WRL::ComPtr<ID3D11Device> dev;
-        HRESULT hr = D3D11CreateDevice(
-            nullptr,                  // pAdapter  = let Windows choose
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,                  // hSoftware
-            0,                        // Flags
-            nullptr, 0,               // no specific feature levels
-            D3D11_SDK_VERSION,
-            &dev, &fl, nullptr);
-
-        if (SUCCEEDED(hr)) {
-            Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
-            hr = dev.As(&dxgiDev);
-            if (SUCCEEDED(hr)) {
-                Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
-                hr = dxgiDev->GetAdapter(&adapter);
-                if (SUCCEEDED(hr)) {
-                    DXGI_ADAPTER_DESC desc{};
-                    hr = adapter->GetDesc(&desc);
-                    if (SUCCEEDED(hr)) {
-                        req->adapterLuid = desc.AdapterLuid;
-                        LOG_INFO("xrGetD3D11GraphicsRequirementsKHR: "
-                                 "adapter='%ls' LUID={%08X,%08X} fl=0x%04X",
-                                 desc.Description,
-                                 (unsigned)desc.AdapterLuid.HighPart,
-                                 (unsigned)desc.AdapterLuid.LowPart,
-                                 (unsigned)fl);
-                    } else {
-                        LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: GetDesc failed 0x%08X", hr);
-                    }
-                } else {
-                    LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: GetAdapter failed 0x%08X", hr);
-                }
-            } else {
-                LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: QueryInterface IDXGIDevice failed 0x%08X", hr);
-            }
-        } else {
-            LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: D3D11CreateDevice failed 0x%08X", hr);
-        }
+    req->adapterLuid = {};
+    D3D_FEATURE_LEVEL fl{}; LUID luid{};
+    if (GetDefaultAdapterLUID(luid, fl)) {
+        req->adapterLuid     = luid;
+        req->minFeatureLevel = fl;
+        LOG_INFO("xrGetD3D11GraphicsRequirementsKHR: LUID={%08X,%08X} fl=0x%04X",
+                 (unsigned)luid.HighPart, (unsigned)luid.LowPart, (unsigned)fl);
+    } else {
+        LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: failed to query adapter");
     }
-
-    if (req->adapterLuid.HighPart == 0 && req->adapterLuid.LowPart == 0) {
-        LOG_ERROR("xrGetD3D11GraphicsRequirementsKHR: LUID is still {0,0} -- app will fail to find adapter");
-    }
-
     return XR_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// D3D12 graphics requirements stub (XR_KHR_D3D12_enable)
+// We report the same adapter LUID so the app picks the right GPU.
+// xrCreateSession with a D3D12 binding returns XR_ERROR_GRAPHICS_DEVICE_INVALID
+// unless the app also provides a D3D11 binding (fallback chain).
+// ---------------------------------------------------------------------------
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetD3D12GraphicsRequirementsKHR(XrInstance /*instance*/,
+                                   XrSystemId /*systemId*/,
+                                   XrGraphicsRequirementsD3D12KHR* req)
+{
+    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR;
+    req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+    req->adapterLuid = {};
+    D3D_FEATURE_LEVEL fl{}; LUID luid{};
+    if (GetDefaultAdapterLUID(luid, fl))
+        req->adapterLuid = luid;
+    LOG_INFO("xrGetD3D12GraphicsRequirementsKHR: stub (LUID={%08X,%08X})",
+             (unsigned)req->adapterLuid.HighPart, (unsigned)req->adapterLuid.LowPart);
+    return XR_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// OpenGL graphics requirements stub (XR_KHR_opengl_enable)
+// ---------------------------------------------------------------------------
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetOpenGLGraphicsRequirementsKHR(XrInstance /*instance*/,
+                                    XrSystemId /*systemId*/,
+                                    XrGraphicsRequirementsOpenGLKHR* req)
+{
+    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR;
+    // Require OpenGL 4.0+ (matches most 3DV-capable NVIDIA hardware)
+    req->minApiVersionSupported = XR_MAKE_VERSION(4, 0, 0);
+    req->maxApiVersionSupported = XR_MAKE_VERSION(4, 6, 0);
+    LOG_INFO("xrGetOpenGLGraphicsRequirementsKHR: stub");
+    return XR_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan graphics requirements stubs (XR_KHR_vulkan_enable / vulkan_enable2)
+// ---------------------------------------------------------------------------
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVulkanGraphicsRequirementsKHR(XrInstance /*instance*/,
+                                    XrSystemId /*systemId*/,
+                                    XrGraphicsRequirementsVulkanKHR* req)
+{
+    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+    req->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
+    req->maxApiVersionSupported = XR_MAKE_VERSION(1, 3, 0);
+    LOG_INFO("xrGetVulkanGraphicsRequirementsKHR: stub");
+    return XR_SUCCESS;
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVulkanGraphicsRequirements2KHR(XrInstance instance,
+                                     XrSystemId systemId,
+                                     XrGraphicsRequirementsVulkanKHR* req)
+{
+    return xrGetVulkanGraphicsRequirementsKHR(instance, systemId, req);
+}
+
+// Vulkan instance/device extension query stubs — return empty lists
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVulkanInstanceExtensionsKHR(XrInstance /*instance*/, XrSystemId /*systemId*/,
+                                   uint32_t cap, uint32_t* count, char* buf)
+{
+    *count = 0;
+    if (cap > 0 && buf) buf[0] = '\0';
+    return XR_SUCCESS;
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVulkanDeviceExtensionsKHR(XrInstance /*instance*/, XrSystemId /*systemId*/,
+                                 uint32_t cap, uint32_t* count, char* buf)
+{
+    *count = 0;
+    if (cap > 0 && buf) buf[0] = '\0';
+    return XR_SUCCESS;
+}
+// xrGetVulkanGraphicsDeviceKHR — we cannot return a VkPhysicalDevice without
+// a Vulkan instance, so return XR_ERROR_FUNCTION_UNSUPPORTED. Apps that need
+// this are genuinely Vulkan-native and cannot use XR3DV for presentation.
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVulkanGraphicsDeviceKHR(XrInstance /*instance*/, XrSystemId /*systemId*/,
+                               void* /*vkInstance*/, void** /*vkPhysicalDevice*/)
+{
+    LOG_ERROR("xrGetVulkanGraphicsDeviceKHR: Vulkan native rendering not supported by XR3DV");
+    return XR_ERROR_FUNCTION_UNSUPPORTED;
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrGetVulkanGraphicsDevice2KHR(XrInstance instance, const void* /*getInfo*/,
+                               void** vkPhysicalDevice)
+{
+    return xrGetVulkanGraphicsDeviceKHR(instance, 0, nullptr, vkPhysicalDevice);
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrCreateVulkanInstanceKHR(XrInstance /*instance*/, const void* /*createInfo*/,
+                           void** /*vkInstance*/, int* /*vkResult*/)
+{
+    LOG_ERROR("xrCreateVulkanInstanceKHR: Vulkan native rendering not supported by XR3DV");
+    return XR_ERROR_FUNCTION_UNSUPPORTED;
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL
+xrCreateVulkanDeviceKHR(XrInstance /*instance*/, const void* /*createInfo*/,
+                         void** /*vkDevice*/, int* /*vkResult*/)
+{
+    LOG_ERROR("xrCreateVulkanDeviceKHR: Vulkan native rendering not supported by XR3DV");
+    return XR_ERROR_FUNCTION_UNSUPPORTED;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +499,18 @@ xrCreateSession(XrInstance /*instance*/,
     }
 
     if (!binding) {
-        LOG_ERROR("xrCreateSession: only XR_KHR_D3D11_enable is supported");
+        // Walk chain once more to log what binding type was actually provided
+        const XrBaseInStructure* n2 =
+            reinterpret_cast<const XrBaseInStructure*>(createInfo->next);
+        while (n2) {
+            LOG_ERROR("xrCreateSession: unsupported graphics binding type %d "
+                      "(XR3DV only supports XR_KHR_D3D11_enable for rendering; "
+                      "Vulkan/D3D12/OpenGL apps must use D3D11 interop or "
+                      "will fail here)", (int)n2->type);
+            n2 = n2->next;
+        }
+        if (!createInfo->next)
+            LOG_ERROR("xrCreateSession: no graphics binding provided");
         return XR_ERROR_GRAPHICS_DEVICE_INVALID;
     }
 
@@ -740,6 +842,20 @@ xrGetInstanceProcAddr(XrInstance /*instance*/, const char* name,
     DISPATCH(xrApplyHapticFeedback)
     DISPATCH(xrStopHapticFeedback)
     DISPATCH(xrGetD3D11GraphicsRequirementsKHR)
+    // XR_KHR_D3D12_enable (stub — reports LUID, session creation unsupported)
+    DISPATCH(xrGetD3D12GraphicsRequirementsKHR)
+    // XR_KHR_opengl_enable (stub)
+    DISPATCH(xrGetOpenGLGraphicsRequirementsKHR)
+    // XR_KHR_vulkan_enable (stub)
+    DISPATCH(xrGetVulkanGraphicsRequirementsKHR)
+    DISPATCH(xrGetVulkanInstanceExtensionsKHR)
+    DISPATCH(xrGetVulkanDeviceExtensionsKHR)
+    DISPATCH(xrGetVulkanGraphicsDeviceKHR)
+    // XR_KHR_vulkan_enable2 (stub)
+    DISPATCH(xrGetVulkanGraphicsRequirements2KHR)
+    DISPATCH(xrCreateVulkanInstanceKHR)
+    DISPATCH(xrCreateVulkanDeviceKHR)
+    DISPATCH(xrGetVulkanGraphicsDevice2KHR)
     // XR_EXT_debug_utils
     DISPATCH(xrCreateDebugUtilsMessengerEXT)
     DISPATCH(xrDestroyDebugUtilsMessengerEXT)

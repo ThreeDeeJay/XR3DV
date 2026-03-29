@@ -65,6 +65,24 @@ EXPORTS
     ; D3D11 graphics binding (XR_KHR_D3D11_enable)
     xrGetD3D11GraphicsRequirementsKHR
 
+    ; D3D12 graphics binding stub (XR_KHR_D3D12_enable)
+    xrGetD3D12GraphicsRequirementsKHR
+
+    ; OpenGL graphics binding stub (XR_KHR_opengl_enable)
+    xrGetOpenGLGraphicsRequirementsKHR
+
+    ; Vulkan graphics binding stubs (XR_KHR_vulkan_enable)
+    xrGetVulkanGraphicsRequirementsKHR
+    xrGetVulkanInstanceExtensionsKHR
+    xrGetVulkanDeviceExtensionsKHR
+    xrGetVulkanGraphicsDeviceKHR
+
+    ; Vulkan2 graphics binding stubs (XR_KHR_vulkan_enable2)
+    xrGetVulkanGraphicsRequirements2KHR
+    xrCreateVulkanInstanceKHR
+    xrCreateVulkanDeviceKHR
+    xrGetVulkanGraphicsDevice2KHR
+
     ; Debug utils (XR_EXT_debug_utils)
     xrCreateDebugUtilsMessengerEXT
     xrDestroyDebugUtilsMessengerEXT
