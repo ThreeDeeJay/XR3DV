@@ -5,6 +5,7 @@
 #include "pch.h"
 #include "swapchain.h"
 #include "logging.h"
+#include <d3d12.h>   // ID3D12Device, ID3D12Resource — COM vtable only
 
 namespace xr3dv {
 
@@ -18,6 +19,16 @@ static bool IsDepthFormat(DXGI_FORMAT fmt) {
             return true;
         default:
             return false;
+    }
+}
+
+Swapchain::~Swapchain() {
+    // Release D3D12 resources stored as void* (AddRef'd in InitShared)
+    for (auto& img : m_images) {
+        if (img.d3d12Tex) {
+            static_cast<ID3D12Resource*>(img.d3d12Tex)->Release();
+            img.d3d12Tex = nullptr;
+        }
     }
 }
 
@@ -151,14 +162,16 @@ bool Swapchain::InitShared(ID3D11Device* d3d11Dev, ID3D12Device* d3d12Dev,
             return false;
         }
 
-        // Open shared handle in D3D12 — pure COM vtable, no d3d12.lib needed
-        hr = d3d12Dev->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(&m_images[i].d3d12Tex));
+        // Open shared handle in D3D12 — pure COM vtable, d3d12.lib not needed
+        ID3D12Resource* d3d12Res = nullptr;
+        hr = d3d12Dev->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(&d3d12Res));
         CloseHandle(sharedHandle); // D3D12 holds its own ref; close ours
         if (FAILED(hr)) {
             LOG_ERROR("Swapchain (shared): OpenSharedHandle [%u] in D3D12 failed: 0x%08X",
                       i, (unsigned)hr);
             return false;
         }
+        m_images[i].d3d12Tex = d3d12Res; // store raw pointer (AddRef'd by OpenSharedHandle)
 
         m_freeQueue.push(i);
     }

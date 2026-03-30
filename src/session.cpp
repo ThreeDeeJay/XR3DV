@@ -5,7 +5,7 @@
 #include "pch.h"
 #include "session.h"
 #include "logging.h"
-#include <d3d12.h>   // ID3D12Device — COM vtable only, no d3d12.lib required
+#include <d3d12.h>   // for InitShared cast: static_cast<ID3D12Device*>
 
 namespace xr3dv {
 
