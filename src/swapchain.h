@@ -13,11 +13,14 @@
 #include <mutex>
 #include <atomic>
 
+// Forward declaration — d3d12.h only included in swapchain.cpp
+struct ID3D12Device;
+struct ID3D12Resource;
+
 namespace xr3dv {
 
 // Forward-declare to avoid pulling d3d12.h into every translation unit.
 // swapchain.cpp includes d3d12.h directly.
-struct ID3D12Device;
 
 /// A pool of textures exposed as an XrSwapchain.
 /// D3D11 mode: plain D3D11 textures (app renders via D3D11 device).

@@ -739,7 +739,7 @@ xrEnumerateSwapchainImages(XrSwapchain swapchain, uint32_t cap, uint32_t* count,
         for (uint32_t i = 0; i < n; ++i) {
             d3d12Images[i].type    = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
             d3d12Images[i].next    = nullptr;
-            d3d12Images[i].texture = sc->Images()[i].d3d12Tex.Get();
+            d3d12Images[i].texture = sc->Images()[i].d3d12Tex;
         }
     } else {
         auto* d3d11Images = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
