@@ -75,6 +75,8 @@ static LRESULT CALLBACK GameWndSubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM
                             auto delta = static_cast<int32_t>(
                                 static_cast<SHORT>(ri->data.mouse.usButtonData));
                             p->m_fovWheelDelta.fetch_add(delta, std::memory_order_relaxed);
+                            LOG_VERBOSE("WM_INPUT wheel: delta=%d accumulated=%d",
+                                        delta, (int)p->m_fovWheelDelta.load());
                         }
                     }
                 }
@@ -383,20 +385,36 @@ void NvapiStereoPresenter::MsgThreadProc()
                 if (msg.message == WM_TIMER) {
                     if (msg.wParam == TIMER_INPUT_POLL) {
                         bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                        LOG_VERBOSE("TIMER_INPUT_POLL: ctrl=%d f3=%d f4=%d f5=%d f6=%d f7=%d wheel=%d",
+                                    (int)ctrl,
+                                    (GetAsyncKeyState(VK_F3) & 0x8000) != 0,
+                                    (GetAsyncKeyState(VK_F4) & 0x8000) != 0,
+                                    (GetAsyncKeyState(VK_F5) & 0x8000) != 0,
+                                    (GetAsyncKeyState(VK_F6) & 0x8000) != 0,
+                                    (GetAsyncKeyState(VK_F7) & 0x8000) != 0,
+                                    (int)m_fovWheelDelta.load());
                         if (ctrl) {
                             float sep = m_separation, conv = m_convergence;
                             bool  chg = false;
                             if      (GetAsyncKeyState(VK_F3) & 0x8000)
-                                { sep  = std::max(0.0f,   sep  - kSepStep);  chg = true; }
+                                { sep  = std::max(0.0f,   sep  - kSepStep);  chg = true;
+                                  LOG_VERBOSE("Hotkey Ctrl+F3: sep %.2f -> %.2f", m_separation, sep); }
                             else if (GetAsyncKeyState(VK_F4) & 0x8000)
-                                { sep  = std::min(100.0f, sep  + kSepStep);  chg = true; }
+                                { sep  = std::min(100.0f, sep  + kSepStep);  chg = true;
+                                  LOG_VERBOSE("Hotkey Ctrl+F4: sep %.2f -> %.2f", m_separation, sep); }
                             if      (GetAsyncKeyState(VK_F5) & 0x8000)
-                                { conv = std::max(0.0f,   conv - kConvStep); chg = true; }
+                                { conv = std::max(0.0f,   conv - kConvStep); chg = true;
+                                  LOG_VERBOSE("Hotkey Ctrl+F5: conv %.3f -> %.3f", m_convergence, conv); }
                             else if (GetAsyncKeyState(VK_F6) & 0x8000)
-                                { conv = std::min(25.0f,  conv + kConvStep); chg = true; }
-                            if (GetAsyncKeyState(VK_F7) & 0x8000)
+                                { conv = std::min(25.0f,  conv + kConvStep); chg = true;
+                                  LOG_VERBOSE("Hotkey Ctrl+F6: conv %.3f -> %.3f", m_convergence, conv); }
+                            if (GetAsyncKeyState(VK_F7) & 0x8000) {
+                                LOG_VERBOSE("Hotkey Ctrl+F7: saving sep=%.2f conv=%.3f fov=%.1f to %s",
+                                            m_separation, m_convergence, m_fov,
+                                            m_gameIniPath.empty() ? "(no path)" : m_gameIniPath.c_str());
                                 SaveGameStereoSettings(m_gameIniPath,
                                                        m_separation, m_convergence, m_fov);
+                            }
                             if (chg) { SetSeparation(sep); SetConvergence(conv); }
                         }
                     }
@@ -734,13 +752,19 @@ bool NvapiStereoPresenter::BlitD3D11ToPacked(
 
 // ---------------------------------------------------------------------------
 void NvapiStereoPresenter::SetSeparation(float pct) {
+    float prev = m_separation;
     m_separation = std::max(0.0f, std::min(pct, 100.0f));
     if (m_stereoHandle) NvAPI_Stereo_SetSeparation(m_stereoHandle, m_separation);
+    LOG_VERBOSE("SetSeparation: %.2f -> %.2f (nvapi handle=%p)",
+                prev, m_separation, (void*)m_stereoHandle);
     LOG_INFO("Separation: %.1f%%", m_separation);
 }
 void NvapiStereoPresenter::SetConvergence(float val) {
+    float prev = m_convergence;
     m_convergence = std::max(0.0f, std::min(val, 25.0f));
     if (m_stereoHandle) NvAPI_Stereo_SetConvergence(m_stereoHandle, m_convergence);
+    LOG_VERBOSE("SetConvergence: %.3f -> %.3f (nvapi handle=%p)",
+                prev, m_convergence, (void*)m_stereoHandle);
     LOG_INFO("Convergence: %.3f", m_convergence);
 }
 

@@ -368,10 +368,12 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
         // Scale: 1 detent = 1° of half-FoV change (matches VRto3D reference).
         int32_t wheel = m_presenter.ConsumeFovDelta();
         if (wheel != 0) {
-            float deg = m_presenter.GetFov() + static_cast<float>(wheel) / 120.0f;
+            float prevFov = m_presenter.GetFov();
+            float deg = prevFov + static_cast<float>(wheel) / 120.0f;
             deg = std::max(10.0f, std::min(deg, 89.0f));
             m_presenter.SetFov(deg);
             m_cfg.fov.store(deg, std::memory_order_relaxed);
+            LOG_VERBOSE("Wheel delta=%d: fov %.1f° -> %.1f°", wheel, prevFov, deg);
             LOG_INFO("FoV adjusted: %.1f°", deg);
         }
     }
