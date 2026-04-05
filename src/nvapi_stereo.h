@@ -36,6 +36,7 @@ public:
     bool Init(uint32_t width, uint32_t height,
               uint32_t fseRate,
               float separation, float convergence,
+              float fov = 45.0f,
               bool swapEyes = false,
               const std::string& gameIniPath = "");
 
@@ -46,9 +47,11 @@ public:
 
     void SetSeparation(float pct);
     void SetConvergence(float val);
+    void SetFov(float deg) { m_fov = std::max(10.0f, std::min(deg, 89.0f)); }
 
     float GetSeparation()  const { return m_separation;  }
     float GetConvergence() const { return m_convergence; }
+    float GetFov()         const { return m_fov; }
     bool  IsInitialised()  const { return m_initialised; }
 
     // Mouse-look: consumed each frame by Session::LocateViews.
@@ -58,10 +61,17 @@ public:
         recenter = m_recenterRequested.exchange(false, std::memory_order_relaxed);
     }
 
+    // FOV wheel: consumed each frame by Session::LocateViews.
+    // Returns accumulated wheel notches (positive = scroll up = increase FOV).
+    int32_t ConsumeFovDelta() {
+        return m_fovWheelDelta.exchange(0, std::memory_order_relaxed);
+    }
+
     // Written by PopupWndProc (free function) via WM_INPUT — must be public.
     std::atomic<int32_t> m_mouseDeltaX{0};
     std::atomic<int32_t> m_mouseDeltaY{0};
     std::atomic<bool>    m_recenterRequested{false};
+    std::atomic<int32_t> m_fovWheelDelta{0}; // wheel notches (+120 per detent up)
 
 private:
     void MsgThreadProc();
@@ -134,6 +144,7 @@ private:
     uint32_t    m_fseRate     = 120;
     float       m_separation  = 50.0f;
     float       m_convergence = 5.0f;
+    float       m_fov         = 45.0f; // degrees, kept in sync by Session::PollConfigThread
     bool        m_swapEyes    = false;
     std::string m_gameIniPath;
 };

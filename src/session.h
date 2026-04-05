@@ -112,6 +112,8 @@ private:
     // Mouse-look state (accumulated from presenter, applied in LocateViews)
     float m_yaw   = 0.f;  // radians, positive = right
     float m_pitch = 0.f;  // radians, positive = up
+    // FOV is driven by the presenter (wheel input + config). Read via GetFov().
+    // No separate m_fov needed — presenter is the single source of truth.
 
     // Eye identification stored during EndFrame
     XrSwapchain  m_leftSwapchain  = XR_NULL_HANDLE;

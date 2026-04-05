@@ -48,6 +48,7 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
             m_cfg.monitorRate,
             m_cfg.separation.load(),
             m_cfg.convergence.load(),
+            m_cfg.fov.load(),
             m_cfg.swapEyes,
             m_cfg.gameIniPath))
     {
@@ -87,7 +88,7 @@ XrResult Session::InitD3D12(void* d3d12DeviceRaw, void* /*d3d12QueueRaw*/)
 
     if (!m_presenter.Init(m_cfg.width, m_cfg.height, m_cfg.monitorRate,
                            m_cfg.separation.load(), m_cfg.convergence.load(),
-                           m_cfg.swapEyes, m_cfg.gameIniPath)) {
+                           m_cfg.fov.load(), m_cfg.swapEyes, m_cfg.gameIniPath)) {
         LOG_ERROR("InitD3D12: failed to initialise NvapiStereoPresenter");
         return XR_ERROR_INITIALIZATION_FAILED;
     }
@@ -107,6 +108,7 @@ void Session::PollConfigThread() {
         if (changed && m_presenter.IsInitialised()) {
             m_presenter.SetSeparation(m_cfg.separation.load());
             m_presenter.SetConvergence(m_cfg.convergence.load());
+            m_presenter.SetFov(m_cfg.fov.load());
         }
     }
 }
@@ -359,8 +361,20 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
 
     // Consume mouse deltas from the presenter
     int32_t dx = 0, dy = 0; bool recenter = false;
-    if (m_presenter.IsInitialised())
+    if (m_presenter.IsInitialised()) {
         m_presenter.ConsumeDelta(dx, dy, recenter);
+
+        // Wheel → FOV. Each standard detent = ±120 units.
+        // Scale: 1 detent = 1° of half-FoV change (matches VRto3D reference).
+        int32_t wheel = m_presenter.ConsumeFovDelta();
+        if (wheel != 0) {
+            float deg = m_presenter.GetFov() + static_cast<float>(wheel) / 120.0f;
+            deg = std::max(10.0f, std::min(deg, 89.0f));
+            m_presenter.SetFov(deg);
+            m_cfg.fov.store(deg, std::memory_order_relaxed);
+            LOG_INFO("FoV adjusted: %.1f°", deg);
+        }
+    }
 
     if (recenter) {
         m_yaw = m_pitch = 0.f;
@@ -373,11 +387,11 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
     }
 
     // Build head orientation: yaw around Y (world-up), then pitch around X (local-right)
-    float hy = sinf(m_yaw   * 0.5f), hw = cosf(m_yaw   * 0.5f); // Y-axis rotation
-    float px = sinf(m_pitch * 0.5f), pw = cosf(m_pitch * 0.5f); // X-axis rotation
+    float hy = sinf(m_yaw   * 0.5f), hw = cosf(m_yaw   * 0.5f);
+    float px = sinf(m_pitch * 0.5f), pw = cosf(m_pitch * 0.5f);
     XrQuaternionf qYaw   = {0.f, hy, 0.f, hw};
     XrQuaternionf qPitch = {px,  0.f, 0.f, pw};
-    XrQuaternionf headQ  = QMul(qYaw, qPitch); // yaw applied first (world space)
+    XrQuaternionf headQ  = QMul(qYaw, qPitch);
 
     viewState->viewStateFlags =
         XR_VIEW_STATE_POSITION_VALID_BIT    |
@@ -386,13 +400,15 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
         XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
 
     float halfIpd = m_cfg.ipd * 0.5f;
-    static const float kFov = 0.7854f; // 45° each side
+    // Convert half-FoV from degrees to radians for XrFovf
+    const float kFov = m_presenter.IsInitialised()
+                       ? (m_presenter.GetFov() * 3.14159265f / 180.0f)
+                       : 0.7854f; // 45° fallback if presenter not yet ready
 
     for (int eye = 0; eye < 2; ++eye) {
         views[eye].type = XR_TYPE_VIEW;
         views[eye].next = nullptr;
         views[eye].pose.orientation = headQ;
-        // Eye position = head origin + head-rotated IPD offset
         float sign = (eye == 0) ? -1.f : 1.f;
         XrVector3f localOffset = {sign * halfIpd, 0.f, 0.f};
         views[eye].pose.position = QRotate(headQ, localOffset);

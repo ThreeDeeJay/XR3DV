@@ -66,9 +66,16 @@ static LRESULT CALLBACK GameWndSubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM
                         p->m_mouseDeltaY.fetch_add(
                             static_cast<int32_t>(ri->data.mouse.lLastY),
                             std::memory_order_relaxed);
+                        // Middle button → recenter head pose
                         if (ri->data.mouse.usButtonFlags &
                                 (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_3_DOWN))
                             p->m_recenterRequested.store(true, std::memory_order_relaxed);
+                        // Wheel → FOV adjustment (+120 per detent up, -120 per detent down)
+                        if (ri->data.mouse.usButtonFlags & RI_MOUSE_WHEEL) {
+                            auto delta = static_cast<int32_t>(
+                                static_cast<SHORT>(ri->data.mouse.usButtonData));
+                            p->m_fovWheelDelta.fetch_add(delta, std::memory_order_relaxed);
+                        }
                     }
                 }
             }
@@ -389,7 +396,7 @@ void NvapiStereoPresenter::MsgThreadProc()
                                 { conv = std::min(25.0f,  conv + kConvStep); chg = true; }
                             if (GetAsyncKeyState(VK_F7) & 0x8000)
                                 SaveGameStereoSettings(m_gameIniPath,
-                                                       m_separation, m_convergence);
+                                                       m_separation, m_convergence, m_fov);
                             if (chg) { SetSeparation(sep); SetConvergence(conv); }
                         }
                     }
@@ -436,11 +443,13 @@ done:
 bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
                                  uint32_t fseRate,
                                  float separation, float convergence,
+                                 float fov,
                                  bool swapEyes,
                                  const std::string& gameIniPath)
 {
     m_width = width; m_height = height; m_fseRate = fseRate;
     m_separation = separation; m_convergence = convergence;
+    m_fov = std::max(10.0f, std::min(fov, 89.0f));
     m_swapEyes = swapEyes; m_gameIniPath = gameIniPath;
 
     NvAPI_Status nvs = NvAPI_Initialize();

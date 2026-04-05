@@ -32,6 +32,9 @@ struct Config {
     std::atomic<float> convergence { 5.0f  };
     /// Interpupillary distance in metres (used for view pose offsets).
     float ipd = 0.064f;
+    /// Per-eye half-FoV in degrees [10, 89]. Symmetric: total horizontal = 2 * fov.
+    /// Default 45° → 90° total, matching a typical VR headset.
+    std::atomic<float> fov { 45.0f };
     /// Swap left and right eyes if they appear reversed.
     bool swapEyes = false;
 
@@ -64,7 +67,7 @@ std::string GetDefaultIniPath();
 /// Returns "" if it cannot be determined.
 std::string GetGameIniPath();
 
-/// Write separation and convergence to the per-game INI (creating it if needed).
-void SaveGameStereoSettings(const std::string& gameIniPath, float sep, float conv);
+/// Write separation, convergence and fov to the per-game INI (creating it if needed).
+void SaveGameStereoSettings(const std::string& gameIniPath, float sep, float conv, float fov);
 
 } // namespace xr3dv

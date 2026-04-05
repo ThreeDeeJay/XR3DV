@@ -117,18 +117,20 @@ bool LoadConfig(Config& cfg, const std::string& iniPath) {
     cfg.separation  = getFloat(ini, "stereo", "separation",  cfg.separation.load());
     cfg.convergence = getFloat(ini, "stereo", "convergence", cfg.convergence.load());
     cfg.ipd         = getFloat(ini, "stereo", "ipd",         cfg.ipd);
+    cfg.fov         = getFloat(ini, "stereo", "fov",         cfg.fov.load());
     cfg.swapEyes    = getBool(ini,  "stereo", "swapeyes",    cfg.swapEyes);
 
     cfg.logLevel = static_cast<int>(getUint(ini, "debug", "loglevel",
                                             static_cast<uint32_t>(cfg.logLevel)));
     cfg.logFile  = getString(ini, "debug", "logfile", cfg.logFile);
 
-    // --- Overlay per-game ini (separation + convergence only) -------------
+    // --- Overlay per-game ini (separation, convergence, fov) ---------------
     if (!cfg.gameIniPath.empty()) {
         IniMap gini = ParseIni(cfg.gameIniPath);
         cfg.gameIniMtimeMs = FileModTime(cfg.gameIniPath);
         cfg.separation  = getFloat(gini, "stereo", "separation",  cfg.separation.load());
         cfg.convergence = getFloat(gini, "stereo", "convergence", cfg.convergence.load());
+        cfg.fov         = getFloat(gini, "stereo", "fov",         cfg.fov.load());
     }
 
     // Clamp
@@ -138,11 +140,12 @@ bool LoadConfig(Config& cfg, const std::string& iniPath) {
     cfg.frameRate   = std::max(24u,   std::min(cfg.frameRate,    360u));
     cfg.separation  = std::max(0.0f,  std::min(cfg.separation.load(),  100.0f));
     cfg.convergence = std::max(0.0f,  std::min(cfg.convergence.load(),  25.0f));
+    cfg.fov         = std::max(10.0f, std::min(cfg.fov.load(),          89.0f));
     cfg.ipd         = std::max(0.04f, std::min(cfg.ipd, 0.10f));
 
-    LOG_INFO("Config: %ux%u monitorRate=%uHz frameRate=%uHz sep=%.1f%% conv=%.2f ipd=%.3fm",
+    LOG_INFO("Config: %ux%u monitorRate=%uHz frameRate=%uHz sep=%.1f%% conv=%.2f fov=%.1f° ipd=%.3fm",
              cfg.width, cfg.height, cfg.monitorRate, cfg.frameRate,
-             cfg.separation.load(), cfg.convergence.load(), cfg.ipd);
+             cfg.separation.load(), cfg.convergence.load(), cfg.fov.load(), cfg.ipd);
     return true;
 }
 
@@ -160,16 +163,18 @@ bool PollConfigReload(Config& cfg) {
     if (!cfg.gameIniPath.empty()) {
         uint64_t mt = FileModTime(cfg.gameIniPath);
         if (mt != 0 && mt != cfg.gameIniMtimeMs) {
-            // Reload only sep/conv from game ini
+            // Reload sep/conv/fov from game ini
             std::lock_guard<std::mutex> lk(cfg.mtx);
             IniMap gini = ParseIni(cfg.gameIniPath);
             cfg.gameIniMtimeMs = mt;
             cfg.separation  = getFloat(gini, "stereo", "separation",  cfg.separation.load());
             cfg.convergence = getFloat(gini, "stereo", "convergence", cfg.convergence.load());
-            cfg.separation  = std::max(0.0f, std::min(cfg.separation.load(),  100.0f));
-            cfg.convergence = std::max(0.0f, std::min(cfg.convergence.load(),  25.0f));
-            LOG_INFO("Game config reloaded: sep=%.1f%% conv=%.2f",
-                     cfg.separation.load(), cfg.convergence.load());
+            cfg.fov         = getFloat(gini, "stereo", "fov",         cfg.fov.load());
+            cfg.separation  = std::max(0.0f,  std::min(cfg.separation.load(),  100.0f));
+            cfg.convergence = std::max(0.0f,  std::min(cfg.convergence.load(),  25.0f));
+            cfg.fov         = std::max(10.0f, std::min(cfg.fov.load(),          89.0f));
+            LOG_INFO("Game config reloaded: sep=%.1f%% conv=%.2f fov=%.1f°",
+                     cfg.separation.load(), cfg.convergence.load(), cfg.fov.load());
             changed = true;
         }
     }
@@ -197,52 +202,43 @@ std::string GetGameIniPath() {
     return std::string(exePath) + "\\xr3dv.ini";
 }
 
-void SaveGameStereoSettings(const std::string& path, float sep, float conv) {
+void SaveGameStereoSettings(const std::string& path, float sep, float conv, float fov) {
     if (path.empty()) return;
 
-    // Read existing game ini lines, replacing/adding sep+conv under [Stereo]
     std::vector<std::string> lines;
     {
         std::ifstream f(path);
-        if (f) {
-            std::string l;
-            while (std::getline(f, l)) lines.push_back(l);
-        }
+        if (f) { std::string l; while (std::getline(f, l)) lines.push_back(l); }
     }
 
-    // Find/update [Stereo] section
-    bool inStereo = false, hasSep = false, hasConv = false;
+    bool inStereo = false, hasSep = false, hasConv = false, hasFov = false;
     for (auto& l : lines) {
         std::string t = ToLower(Trim(l));
         if (!t.empty() && t[0] == '[') {
             inStereo = (t == "[stereo]");
         } else if (inStereo) {
-            if (t.rfind("separation", 0) == 0) {
-                char buf[64]; snprintf(buf, sizeof(buf), "Separation=%.2f", sep);
-                l = buf; hasSep = true;
-            } else if (t.rfind("convergence", 0) == 0) {
-                char buf[64]; snprintf(buf, sizeof(buf), "Convergence=%.3f", conv);
-                l = buf; hasConv = true;
-            }
+            char buf[64];
+            if      (t.rfind("separation",  0) == 0) { snprintf(buf, sizeof(buf), "Separation=%.2f",  sep);  l = buf; hasSep  = true; }
+            else if (t.rfind("convergence", 0) == 0) { snprintf(buf, sizeof(buf), "Convergence=%.3f", conv); l = buf; hasConv = true; }
+            else if (t.rfind("fov",         0) == 0) { snprintf(buf, sizeof(buf), "Fov=%.2f",         fov);  l = buf; hasFov  = true; }
         }
     }
 
-    // Append missing keys
-    if (!hasSep || !hasConv) {
+    if (!hasSep || !hasConv || !hasFov) {
         bool foundSection = false;
-        for (auto& l : lines) {
+        for (auto& l : lines)
             if (ToLower(Trim(l)) == "[stereo]") { foundSection = true; break; }
-        }
         if (!foundSection) lines.push_back("[Stereo]");
         char buf[64];
         if (!hasSep)  { snprintf(buf, sizeof(buf), "Separation=%.2f",  sep);  lines.push_back(buf); }
         if (!hasConv) { snprintf(buf, sizeof(buf), "Convergence=%.3f", conv); lines.push_back(buf); }
+        if (!hasFov)  { snprintf(buf, sizeof(buf), "Fov=%.2f",         fov);  lines.push_back(buf); }
     }
 
     std::ofstream f(path);
     if (!f) { LOG_ERROR("SaveGameStereoSettings: cannot write %s", path.c_str()); return; }
     for (auto& l : lines) f << l << "\n";
-    LOG_INFO("Saved stereo settings to %s: sep=%.2f conv=%.3f", path.c_str(), sep, conv);
+    LOG_INFO("Saved stereo settings to %s: sep=%.2f conv=%.3f fov=%.1f°", path.c_str(), sep, conv, fov);
 }
 
 } // namespace xr3dv
