@@ -50,6 +50,7 @@ XrResult Session::InitD3D11(const XrGraphicsBindingD3D11KHR* binding) {
             m_cfg.convergence.load(),
             m_cfg.fov.load(),
             m_cfg.swapEyes,
+            m_cfg.forcePopup,
             m_cfg.gameIniPath))
     {
         LOG_ERROR("Failed to initialise NvapiStereoPresenter");
@@ -88,7 +89,8 @@ XrResult Session::InitD3D12(void* d3d12DeviceRaw, void* /*d3d12QueueRaw*/)
 
     if (!m_presenter.Init(m_cfg.width, m_cfg.height, m_cfg.monitorRate,
                            m_cfg.separation.load(), m_cfg.convergence.load(),
-                           m_cfg.fov.load(), m_cfg.swapEyes, m_cfg.gameIniPath)) {
+                           m_cfg.fov.load(), m_cfg.swapEyes, m_cfg.forcePopup,
+                           m_cfg.gameIniPath)) {
         LOG_ERROR("InitD3D12: failed to initialise NvapiStereoPresenter");
         return XR_ERROR_INITIALIZATION_FAILED;
     }

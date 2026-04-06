@@ -37,6 +37,10 @@ struct Config {
     std::atomic<float> fov { 45.0f };
     /// Swap left and right eyes if they appear reversed.
     bool swapEyes = false;
+    /// Force a separate XR3DV popup window instead of using the game's HWND.
+    /// Use this if hotkeys / mouse-look don't work (game may hold exclusive
+    /// Raw Input or keyboard focus).  Audio may cut out with this enabled.
+    bool forcePopup = false;
 
     // ---- [Debug] ---------------------------------------------------------
     int         logLevel = 1;    ///< 0=off 1=errors 2=info 3=verbose 4=trace

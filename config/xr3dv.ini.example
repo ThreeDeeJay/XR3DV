@@ -24,7 +24,7 @@ Separation=50.0
 ;   adjusting via 3DV hardware buttons will update this value automatically.
 Convergence=5.000
 
-; Ctrl+F7 = save current separation/convergence to the per-game xr3dv.ini
+; Ctrl+F7 = save current separation/convergence/fov to the per-game xr3dv.ini
 
 ; Interpupillary distance in metres
 IPD=0.064
@@ -32,6 +32,17 @@ IPD=0.064
 ; If the left and right eyes appear swapped (wrong depth on near/far objects)
 ; set SwapEyes=true
 SwapEyes=false
+
+; Per-eye half-FoV in degrees [10–89]. Default 45 = 90° total horizontal FoV.
+; Mouse wheel adjusts this live. Ctrl+F7 saves the current value.
+Fov=45.0
+
+; ForcePopup=true: XR3DV creates its own separate window for D3D9 FSE instead
+; of rendering directly on the game window. Use this if hotkeys or mouse-look
+; don't work (the game may hold exclusive Raw Input or keyboard focus).
+; Note: audio may cut out with ForcePopup=true because the game window loses
+; foreground status when the XR3DV window takes over the display.
+ForcePopup=false
 
 [Debug]
 ; 0=off  1=errors  2=info  3=verbose  4=trace

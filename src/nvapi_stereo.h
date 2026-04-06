@@ -38,6 +38,7 @@ public:
               float separation, float convergence,
               float fov = 45.0f,
               bool swapEyes = false,
+              bool forcePopup = false,
               const std::string& gameIniPath = "");
 
     bool PresentStereoFrame(
@@ -144,8 +145,9 @@ private:
     uint32_t    m_fseRate     = 120;
     float       m_separation  = 50.0f;
     float       m_convergence = 5.0f;
-    float       m_fov         = 45.0f; // degrees, kept in sync by Session::PollConfigThread
+    float       m_fov         = 45.0f;
     bool        m_swapEyes    = false;
+    bool        m_forcePopup  = false;
     std::string m_gameIniPath;
 };
 

@@ -119,6 +119,7 @@ bool LoadConfig(Config& cfg, const std::string& iniPath) {
     cfg.ipd         = getFloat(ini, "stereo", "ipd",         cfg.ipd);
     cfg.fov         = getFloat(ini, "stereo", "fov",         cfg.fov.load());
     cfg.swapEyes    = getBool(ini,  "stereo", "swapeyes",    cfg.swapEyes);
+    cfg.forcePopup  = getBool(ini,  "stereo", "forcepopup",  cfg.forcePopup);
 
     cfg.logLevel = static_cast<int>(getUint(ini, "debug", "loglevel",
                                             static_cast<uint32_t>(cfg.logLevel)));

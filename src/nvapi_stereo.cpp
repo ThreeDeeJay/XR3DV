@@ -181,13 +181,21 @@ void NvapiStereoPresenter::MsgThreadProc()
     // Primary: game's own HWND — audio/cursor/input work natively since the
     // game window IS the foreground window. The Init() pump loop dispatches
     // any synchronous cross-thread messages from CreateDeviceEx safely.
-    // Fallback: our own popup window for apps with no visible window at
-    // session time (xr3dv_diag, hello_xr, headless test tools).
-    if (m_gameHwnd) {
+    // ForcePopup=true: always create our own popup window. Use when the game
+    // holds exclusive Raw Input or keyboard focus and hotkeys don't fire.
+    // Audio may cut out with ForcePopup=true; mouse-look and hotkeys work.
+    const bool usePopup = m_forcePopup || !m_gameHwnd;
+    if (!usePopup) {
         m_hwnd      = m_gameHwnd;
         m_ownedHwnd = nullptr; // we do not own this window
+        LOG_INFO("D3D9 device window: game HWND=%p (ForcePopup=false)", (void*)m_hwnd);
     } else {
-        LOG_INFO("No game window found — creating popup fallback for D3D9 FSE");
+        if (m_forcePopup && m_gameHwnd)
+            LOG_INFO("ForcePopup=true: creating popup window (game HWND=%p will be input target)",
+                     (void*)m_gameHwnd);
+        else
+            LOG_INFO("No game window found — creating popup fallback for D3D9 FSE");
+
         static const wchar_t kClass[] = L"XR3DV_Popup";
         {
             WNDCLASSEXW wc{};
@@ -215,9 +223,12 @@ void NvapiStereoPresenter::MsgThreadProc()
         m_hwnd = m_ownedHwnd;
     }
 
-    // Register Raw Input (RIDEV_INPUTSINK = receive even when not foreground).
-    // On the popup path Raw Input goes to PopupWndProc (default proc ignores it,
-    // deltas stay zero — mouse-look just won't work for windowless apps).
+    // Register Raw Input on the device window with RIDEV_INPUTSINK.
+    // On the game-HWND path, WM_INPUT arrives via GameWndSubclassProc.
+    // On the popup path, WM_INPUT arrives via DefWindowProcW (ignored for
+    // mouse moves since DefWindowProc doesn't call our handler) — BUT
+    // GetAsyncKeyState in TIMER_INPUT_POLL still works because that API
+    // queries the global key state, not the window message queue.
     g_presenterForInput = this;
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
@@ -227,9 +238,6 @@ void NvapiStereoPresenter::MsgThreadProc()
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
         LOG_ERROR("RegisterRawInputDevices failed GLE=%u — mouse-look unavailable",
                   GetLastError());
-
-    LOG_INFO("D3D9 device window: %p (%s)",
-             (void*)m_hwnd, m_ownedHwnd ? "popup fallback" : "game HWND");
 
     // ---- 3. D3D9Ex ----
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
@@ -463,12 +471,13 @@ bool NvapiStereoPresenter::Init(uint32_t width, uint32_t height,
                                  float separation, float convergence,
                                  float fov,
                                  bool swapEyes,
+                                 bool forcePopup,
                                  const std::string& gameIniPath)
 {
     m_width = width; m_height = height; m_fseRate = fseRate;
     m_separation = separation; m_convergence = convergence;
     m_fov = std::max(10.0f, std::min(fov, 89.0f));
-    m_swapEyes = swapEyes; m_gameIniPath = gameIniPath;
+    m_swapEyes = swapEyes; m_forcePopup = forcePopup; m_gameIniPath = gameIniPath;
 
     NvAPI_Status nvs = NvAPI_Initialize();
     if (nvs != NVAPI_OK) {
