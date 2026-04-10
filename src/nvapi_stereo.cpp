@@ -154,7 +154,49 @@ static HWND FindGameWindow(HWND excludeHwnd)
     return ctx.result;
 }
 
-// g_presenterForInput declared near top of file, before GameWndSubclassProc.
+// ---------------------------------------------------------------------------
+// Popup WndProc — used when ForcePopup=true or no game window found.
+// Processes WM_INPUT for mouse-look. DefWindowProcW silently drops WM_INPUT
+// via DefRawInputProc, so we MUST have a real WndProc to handle it.
+// ---------------------------------------------------------------------------
+static LRESULT CALLBACK PopupWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_INPUT) {
+        NvapiStereoPresenter* p = g_presenterForInput;
+        if (p) {
+            UINT sz = 0;
+            GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
+                            RID_INPUT, nullptr, &sz, sizeof(RAWINPUTHEADER));
+            if (sz > 0 && sz <= 256) {
+                BYTE buf[256];
+                if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
+                                    RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
+                    const auto* ri = reinterpret_cast<const RAWINPUT*>(buf);
+                    if (ri->header.dwType == RIM_TYPEMOUSE &&
+                        (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                        p->m_mouseDeltaX.fetch_add(
+                            static_cast<int32_t>(ri->data.mouse.lLastX),
+                            std::memory_order_relaxed);
+                        p->m_mouseDeltaY.fetch_add(
+                            static_cast<int32_t>(ri->data.mouse.lLastY),
+                            std::memory_order_relaxed);
+                        if (ri->data.mouse.usButtonFlags &
+                                (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_3_DOWN))
+                            p->m_recenterRequested.store(true, std::memory_order_relaxed);
+                        if (ri->data.mouse.usButtonFlags & RI_MOUSE_WHEEL) {
+                            auto delta = static_cast<int32_t>(
+                                static_cast<SHORT>(ri->data.mouse.usButtonData));
+                            p->m_fovWheelDelta.fetch_add(delta, std::memory_order_relaxed);
+                            LOG_VERBOSE("WM_INPUT wheel (popup): delta=%d", delta);
+                        }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    return DefWindowProcW(hw, msg, wp, lp);
+}
 
 // ---------------------------------------------------------------------------
 // MsgThreadProc
@@ -199,7 +241,7 @@ void NvapiStereoPresenter::MsgThreadProc()
         static const wchar_t kClass[] = L"XR3DV_Popup";
         {
             WNDCLASSEXW wc{};
-            wc.cbSize = sizeof(wc); wc.lpfnWndProc = DefWindowProcW;
+            wc.cbSize = sizeof(wc); wc.lpfnWndProc = PopupWndProc;
             wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass;
             RegisterClassExW(&wc); // idempotent
         }
@@ -353,9 +395,13 @@ void NvapiStereoPresenter::MsgThreadProc()
     }
     if (m_gameHwnd) LOG_INFO("Game window: %p", (void*)m_gameHwnd);
 
-    // ---- 8. Timers (thread-queue) ----
-    SetTimer(nullptr, TIMER_INPUT_POLL,  50,  nullptr);
-    SetTimer(nullptr, TIMER_STEREO_SYNC, 500, nullptr);
+    // ---- 8. (Timers removed) ----
+    // We use explicit time tracking instead of SetTimer + WM_TIMER because
+    // WM_TIMER messages are only generated when the thread *explicitly* checks
+    // for them (PeekMessage/GetMessage), and MsgWaitForMultipleObjectsEx may
+    // block on WAIT_TIMEOUT branches without draining the queue — causing timers
+    // to fire only a couple of times then silently stall. Time-based polling is
+    // robust regardless of message-queue activity level.
 
     // ---- 9. Signal init complete ----
     m_initOk.store(true);
@@ -363,103 +409,114 @@ void NvapiStereoPresenter::MsgThreadProc()
 
     PostThreadMessageW(m_msgThreadId, WM_XR3DV_RETRY_ACTIVATE, 0, 0);
 
-    // ---- Message pump ----
+    // ---- Message pump with explicit time-based polling ----
+    ULONGLONG lastHotkeyMs  = GetTickCount64();
+    ULONGLONG lastStereoMs  = GetTickCount64();
+    static constexpr ULONGLONG kHotkeyIntervalMs  = 50;
+    static constexpr ULONGLONG kStereoSyncIntervalMs = 500;
+
     while (!m_msgStop.load(std::memory_order_relaxed)) {
-        if (MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT,
-                                         MWMO_INPUTAVAILABLE) != WAIT_TIMEOUT) {
-            MSG msg;
-            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                if (msg.message == WM_QUIT) { m_msgStop = true; goto done; }
+        // Drain all pending messages without blocking
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { m_msgStop = true; goto done; }
 
-                if (msg.message == WM_XR3DV_RETRY_ACTIVATE) {
-                    if (m_device && m_stereoHandle && !m_stereoActivated.load()) {
-                        m_device->Clear(0, nullptr, D3DCLEAR_TARGET,
-                                        D3DCOLOR_XRGB(0,0,0), 1.f, 0);
-                        m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
-                        Sleep(50);
-                        NvAPI_Stereo_Activate(m_stereoHandle);
-                        NvU8 active = 0;
-                        NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
-                        if (active) {
-                            m_stereoActivated.store(true);
-                            LOG_INFO("Stereo activated (post dummy Present): SetActiveEye path");
-                        } else {
-                            LOG_INFO("Stereo activation retry: NO — packed-surface fallback");
-                        }
-                    }
-                    continue;
-                }
-
-                if (msg.message == WM_TIMER) {
-                    if (msg.wParam == TIMER_INPUT_POLL) {
-                        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                        LOG_VERBOSE("TIMER_INPUT_POLL: ctrl=%d f3=%d f4=%d f5=%d f6=%d f7=%d wheel=%d",
-                                    (int)ctrl,
-                                    (GetAsyncKeyState(VK_F3) & 0x8000) != 0,
-                                    (GetAsyncKeyState(VK_F4) & 0x8000) != 0,
-                                    (GetAsyncKeyState(VK_F5) & 0x8000) != 0,
-                                    (GetAsyncKeyState(VK_F6) & 0x8000) != 0,
-                                    (GetAsyncKeyState(VK_F7) & 0x8000) != 0,
-                                    (int)m_fovWheelDelta.load());
-                        if (ctrl) {
-                            float sep = m_separation, conv = m_convergence;
-                            bool  chg = false;
-                            if      (GetAsyncKeyState(VK_F3) & 0x8000)
-                                { sep  = std::max(0.0f,   sep  - kSepStep);  chg = true;
-                                  LOG_VERBOSE("Hotkey Ctrl+F3: sep %.2f -> %.2f", m_separation, sep); }
-                            else if (GetAsyncKeyState(VK_F4) & 0x8000)
-                                { sep  = std::min(100.0f, sep  + kSepStep);  chg = true;
-                                  LOG_VERBOSE("Hotkey Ctrl+F4: sep %.2f -> %.2f", m_separation, sep); }
-                            if      (GetAsyncKeyState(VK_F5) & 0x8000)
-                                { conv = std::max(0.0f,   conv - kConvStep); chg = true;
-                                  LOG_VERBOSE("Hotkey Ctrl+F5: conv %.3f -> %.3f", m_convergence, conv); }
-                            else if (GetAsyncKeyState(VK_F6) & 0x8000)
-                                { conv = std::min(25.0f,  conv + kConvStep); chg = true;
-                                  LOG_VERBOSE("Hotkey Ctrl+F6: conv %.3f -> %.3f", m_convergence, conv); }
-                            if (GetAsyncKeyState(VK_F7) & 0x8000) {
-                                LOG_VERBOSE("Hotkey Ctrl+F7: saving sep=%.2f conv=%.3f fov=%.1f to %s",
-                                            m_separation, m_convergence, m_fov,
-                                            m_gameIniPath.empty() ? "(no path)" : m_gameIniPath.c_str());
-                                SaveGameStereoSettings(m_gameIniPath,
-                                                       m_separation, m_convergence, m_fov);
-                            }
-                            if (chg) { SetSeparation(sep); SetConvergence(conv); }
-                        }
-                    }
-                    else if (msg.wParam == TIMER_STEREO_SYNC && m_stereoHandle) {
-                        NvU8 active = 0;
-                        NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
-                        if (!active) {
-                            NvAPI_Stereo_Activate(m_stereoHandle);
-                            NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
-                            if (active) {
-                                m_stereoActivated.store(true);
-                                LOG_INFO("Stereo activated (deferred): SetActiveEye path");
-                            }
-                        }
-                        if (active) {
-                            float ds = 0.f, dc = 0.f;
-                            NvAPI_Stereo_GetSeparation(m_stereoHandle, &ds);
-                            NvAPI_Stereo_GetConvergence(m_stereoHandle, &dc);
-                            if (fabsf(ds - m_separation)  > 0.05f) {
-                                m_separation = ds;
-                                LOG_INFO("Separation synced: %.1f%%", m_separation);
-                            }
-                            if (fabsf(dc - m_convergence) > 0.005f) {
-                                m_convergence = dc;
-                                LOG_INFO("Convergence synced: %.3f", m_convergence);
-                            }
-                        }
+            if (msg.message == WM_XR3DV_RETRY_ACTIVATE) {
+                if (m_device && m_stereoHandle && !m_stereoActivated.load()) {
+                    m_device->Clear(0, nullptr, D3DCLEAR_TARGET,
+                                    D3DCOLOR_XRGB(0,0,0), 1.f, 0);
+                    m_device->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+                    Sleep(50);
+                    NvAPI_Stereo_Activate(m_stereoHandle);
+                    NvU8 active = 0;
+                    NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
+                    if (active) {
+                        m_stereoActivated.store(true);
+                        LOG_INFO("Stereo activated (post dummy Present): SetActiveEye path");
+                    } else {
+                        LOG_INFO("Stereo activation retry: NO — packed-surface fallback");
                     }
                 }
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+                continue;
+            }
+
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        ULONGLONG now = GetTickCount64();
+
+        // Hotkey poll every 50 ms
+        if (now - lastHotkeyMs >= kHotkeyIntervalMs) {
+            lastHotkeyMs = now;
+
+            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            LOG_VERBOSE("Hotkey poll: ctrl=%d f3=%d f4=%d f5=%d f6=%d f7=%d wheel=%d",
+                        (int)ctrl,
+                        (GetAsyncKeyState(VK_F3) & 0x8000) != 0,
+                        (GetAsyncKeyState(VK_F4) & 0x8000) != 0,
+                        (GetAsyncKeyState(VK_F5) & 0x8000) != 0,
+                        (GetAsyncKeyState(VK_F6) & 0x8000) != 0,
+                        (GetAsyncKeyState(VK_F7) & 0x8000) != 0,
+                        (int)m_fovWheelDelta.load());
+            if (ctrl) {
+                float sep = m_separation, conv = m_convergence;
+                bool  chg = false;
+                if      (GetAsyncKeyState(VK_F3) & 0x8000)
+                    { sep  = std::max(0.0f,   sep  - kSepStep);  chg = true;
+                      LOG_VERBOSE("Hotkey Ctrl+F3: sep %.2f -> %.2f", m_separation, sep); }
+                else if (GetAsyncKeyState(VK_F4) & 0x8000)
+                    { sep  = std::min(100.0f, sep  + kSepStep);  chg = true;
+                      LOG_VERBOSE("Hotkey Ctrl+F4: sep %.2f -> %.2f", m_separation, sep); }
+                if      (GetAsyncKeyState(VK_F5) & 0x8000)
+                    { conv = std::max(0.0f,   conv - kConvStep); chg = true;
+                      LOG_VERBOSE("Hotkey Ctrl+F5: conv %.3f -> %.3f", m_convergence, conv); }
+                else if (GetAsyncKeyState(VK_F6) & 0x8000)
+                    { conv = std::min(25.0f,  conv + kConvStep); chg = true;
+                      LOG_VERBOSE("Hotkey Ctrl+F6: conv %.3f -> %.3f", m_convergence, conv); }
+                if (GetAsyncKeyState(VK_F7) & 0x8000) {
+                    LOG_VERBOSE("Hotkey Ctrl+F7: saving sep=%.2f conv=%.3f fov=%.1f to %s",
+                                m_separation, m_convergence, m_fov,
+                                m_gameIniPath.empty() ? "(no path)" : m_gameIniPath.c_str());
+                    SaveGameStereoSettings(m_gameIniPath, m_separation, m_convergence, m_fov);
+                }
+                if (chg) { SetSeparation(sep); SetConvergence(conv); }
             }
         }
+
+        // Stereo OSD sync every 500 ms
+        if (now - lastStereoMs >= kStereoSyncIntervalMs && m_stereoHandle) {
+            lastStereoMs = now;
+            NvU8 active = 0;
+            NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
+            if (!active) {
+                NvAPI_Stereo_Activate(m_stereoHandle);
+                NvAPI_Stereo_IsActivated(m_stereoHandle, &active);
+                if (active) {
+                    m_stereoActivated.store(true);
+                    LOG_INFO("Stereo activated (deferred): SetActiveEye path");
+                }
+            }
+            if (active) {
+                float ds = 0.f, dc = 0.f;
+                NvAPI_Stereo_GetSeparation(m_stereoHandle, &ds);
+                NvAPI_Stereo_GetConvergence(m_stereoHandle, &dc);
+                if (fabsf(ds - m_separation)  > 0.05f) {
+                    m_separation = ds;
+                    LOG_INFO("Separation synced: %.1f%%", m_separation);
+                }
+                if (fabsf(dc - m_convergence) > 0.005f) {
+                    m_convergence = dc;
+                    LOG_INFO("Convergence synced: %.3f", m_convergence);
+                }
+            }
+        }
+
+        // Sleep the remainder of the hotkey interval to avoid busy-wait
+        Sleep(10);
     }
 done:
-    KillTimer(nullptr, TIMER_INPUT_POLL);
-    KillTimer(nullptr, TIMER_STEREO_SYNC);
+    ;
 }
 
 // ---------------------------------------------------------------------------

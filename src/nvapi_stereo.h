@@ -132,9 +132,6 @@ private:
     std::atomic<bool> m_initOk{false};
     DWORD             m_msgThreadId = 0;
 
-    static constexpr UINT_PTR TIMER_INPUT_POLL  = 1;
-    static constexpr UINT_PTR TIMER_STEREO_SYNC = 2;
-
     static constexpr float kSepStep  = 1.0f;
     static constexpr float kConvStep = 0.1f;
 
