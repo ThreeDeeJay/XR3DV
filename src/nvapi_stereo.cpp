@@ -154,41 +154,76 @@ static HWND FindGameWindow(HWND excludeHwnd)
     return ctx.result;
 }
 
+// g_presenterForInput declared near top of file, before GameWndSubclassProc.
+
+// Game HWND to forward mouse input to when using popup window.
+static HWND g_gameHwndForForward = nullptr;
+
 // ---------------------------------------------------------------------------
 // Popup WndProc — used when ForcePopup=true or no game window found.
 // Processes WM_INPUT for mouse-look. DefWindowProcW silently drops WM_INPUT
 // via DefRawInputProc, so we MUST have a real WndProc to handle it.
+// Mouse relative deltas are forwarded to the game via SendInput so the game
+// still receives mouse movement even though the popup owns the display.
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK PopupWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_INPUT) {
         NvapiStereoPresenter* p = g_presenterForInput;
-        if (p) {
-            UINT sz = 0;
-            GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
-                            RID_INPUT, nullptr, &sz, sizeof(RAWINPUTHEADER));
-            if (sz > 0 && sz <= 256) {
-                BYTE buf[256];
-                if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
-                                    RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
-                    const auto* ri = reinterpret_cast<const RAWINPUT*>(buf);
-                    if (ri->header.dwType == RIM_TYPEMOUSE &&
-                        (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
-                        p->m_mouseDeltaX.fetch_add(
-                            static_cast<int32_t>(ri->data.mouse.lLastX),
-                            std::memory_order_relaxed);
-                        p->m_mouseDeltaY.fetch_add(
-                            static_cast<int32_t>(ri->data.mouse.lLastY),
-                            std::memory_order_relaxed);
-                        if (ri->data.mouse.usButtonFlags &
-                                (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_3_DOWN))
-                            p->m_recenterRequested.store(true, std::memory_order_relaxed);
-                        if (ri->data.mouse.usButtonFlags & RI_MOUSE_WHEEL) {
-                            auto delta = static_cast<int32_t>(
-                                static_cast<SHORT>(ri->data.mouse.usButtonData));
-                            p->m_fovWheelDelta.fetch_add(delta, std::memory_order_relaxed);
-                            LOG_VERBOSE("WM_INPUT wheel (popup): delta=%d", delta);
-                        }
+        UINT sz = 0;
+        GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
+                        RID_INPUT, nullptr, &sz, sizeof(RAWINPUTHEADER));
+        if (p && sz > 0 && sz <= 256) {
+            BYTE buf[256];
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),
+                                RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
+                const auto* ri = reinterpret_cast<const RAWINPUT*>(buf);
+                if (ri->header.dwType == RIM_TYPEMOUSE &&
+                    (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+
+                    const LONG dx = ri->data.mouse.lLastX;
+                    const LONG dy = ri->data.mouse.lLastY;
+
+                    // Accumulate for mouse-look
+                    p->m_mouseDeltaX.fetch_add(static_cast<int32_t>(dx),
+                                               std::memory_order_relaxed);
+                    p->m_mouseDeltaY.fetch_add(static_cast<int32_t>(dy),
+                                               std::memory_order_relaxed);
+
+                    // Middle button → recenter
+                    if (ri->data.mouse.usButtonFlags &
+                            (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_3_DOWN))
+                        p->m_recenterRequested.store(true, std::memory_order_relaxed);
+
+                    // Wheel → FOV
+                    if (ri->data.mouse.usButtonFlags & RI_MOUSE_WHEEL) {
+                        auto delta = static_cast<int32_t>(
+                            static_cast<SHORT>(ri->data.mouse.usButtonData));
+                        p->m_fovWheelDelta.fetch_add(delta, std::memory_order_relaxed);
+                        LOG_VERBOSE("WM_INPUT wheel (popup): delta=%d", delta);
+                    }
+
+                    // Forward relative motion + button events to the game window
+                    // via SendInput so the game's own input processing works.
+                    HWND gh = g_gameHwndForForward;
+                    if (gh && (dx != 0 || dy != 0 ||
+                               ri->data.mouse.usButtonFlags != 0)) {
+                        INPUT inp{};
+                        inp.type           = INPUT_MOUSE;
+                        inp.mi.dx          = dx;
+                        inp.mi.dy          = dy;
+                        inp.mi.mouseData   = ri->data.mouse.usButtonData;
+                        inp.mi.dwFlags     = MOUSEEVENTF_MOVE;
+                        // Map Raw Input button flags → MOUSEEVENTF_* flags
+                        const USHORT bf = ri->data.mouse.usButtonFlags;
+                        if (bf & RI_MOUSE_LEFT_BUTTON_DOWN)   inp.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+                        if (bf & RI_MOUSE_LEFT_BUTTON_UP)     inp.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+                        if (bf & RI_MOUSE_RIGHT_BUTTON_DOWN)  inp.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
+                        if (bf & RI_MOUSE_RIGHT_BUTTON_UP)    inp.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
+                        if (bf & RI_MOUSE_MIDDLE_BUTTON_DOWN) inp.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
+                        if (bf & RI_MOUSE_MIDDLE_BUTTON_UP)   inp.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+                        if (bf & RI_MOUSE_WHEEL)              inp.mi.dwFlags |= MOUSEEVENTF_WHEEL;
+                        SendInput(1, &inp, sizeof(INPUT));
                     }
                 }
             }
@@ -214,6 +249,7 @@ void NvapiStereoPresenter::MsgThreadProc()
     m_gameHwnd = FindGameWindow(nullptr);
     if (m_gameHwnd) {
         InstallGameSubclass(m_gameHwnd);
+        g_gameHwndForForward = m_gameHwnd;
         LOG_INFO("Pre-FSE game window: %p (subclassed=YES)", (void*)m_gameHwnd);
     } else {
         LOG_INFO("Pre-FSE game window: not found yet (no in-process visible window)");
@@ -265,21 +301,27 @@ void NvapiStereoPresenter::MsgThreadProc()
         m_hwnd = m_ownedHwnd;
     }
 
-    // Register Raw Input on the device window with RIDEV_INPUTSINK.
-    // On the game-HWND path, WM_INPUT arrives via GameWndSubclassProc.
-    // On the popup path, WM_INPUT arrives via DefWindowProcW (ignored for
-    // mouse moves since DefWindowProc doesn't call our handler) — BUT
-    // GetAsyncKeyState in TIMER_INPUT_POLL still works because that API
-    // queries the global key state, not the window message queue.
+    // Register Raw Input on the device window.
+    // RIDEV_EXINPUTSINK: receive input even when not foreground AND overrides
+    // any existing exclusive Raw Input registrations the game may have made.
+    // This is the only flag that works when the game uses RIDEV_EXINPUTSINK itself.
     g_presenterForInput = this;
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01; // HID_USAGE_PAGE_GENERIC
     rid.usUsage     = 0x02; // HID_USAGE_GENERIC_MOUSE
-    rid.dwFlags     = RIDEV_INPUTSINK;
+    rid.dwFlags     = RIDEV_EXINPUTSINK;
     rid.hwndTarget  = m_hwnd;
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
         LOG_ERROR("RegisterRawInputDevices failed GLE=%u — mouse-look unavailable",
                   GetLastError());
+    else
+        LOG_INFO("Raw Input registered (RIDEV_EXINPUTSINK) on HWND=%p", (void*)m_hwnd);
+
+    // D3D9 FSE clips the cursor to the FSE window — release that clip so
+    // the game can still move the cursor. We read relative deltas via Raw Input
+    // so we don't need the cursor to be constrained.
+    // (Called after CreateDeviceEx below; set this flag to remind us.)
+    bool needClipRelease = usePopup;
 
     // ---- 3. D3D9Ex ----
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &m_d3d9);
@@ -330,6 +372,14 @@ void NvapiStereoPresenter::MsgThreadProc()
         RemoveGameSubclass(); m_initOk.store(false); m_initDone.store(true); return;
     }
     LOG_INFO("D3D9 FSE device: %ux%u@%uHz", m_width, m_height, m_fseRate);
+
+    // D3D9 FSE confines the cursor to the FSE window. Release that confinement
+    // so the OS cursor can move freely — we read relative motion via Raw Input
+    // and forward it to the game ourselves when in popup mode.
+    if (needClipRelease) {
+        ClipCursor(nullptr);
+        LOG_INFO("Cursor clip released (popup FSE mode)");
+    }
 
     // ---- 5. NVAPI stereo ----
     NvAPI_Status nvs = NvAPI_Stereo_CreateHandleFromIUnknown(m_device.Get(), &m_stereoHandle);
@@ -387,9 +437,11 @@ void NvapiStereoPresenter::MsgThreadProc()
             LOG_INFO("Game window updated: %p -> %p", (void*)m_gameHwnd, (void*)found);
             RemoveGameSubclass();
             m_gameHwnd = found;
+            g_gameHwndForForward = found;
             InstallGameSubclass(found);
         } else if (!m_gameHwnd && found) {
             m_gameHwnd = found;
+            g_gameHwndForForward = found;
             InstallGameSubclass(found);
         }
     }
@@ -837,7 +889,8 @@ void NvapiStereoPresenter::SetConvergence(float val) {
 // ---------------------------------------------------------------------------
 NvapiStereoPresenter::~NvapiStereoPresenter() {
     m_initialised = false;
-    g_presenterForInput = nullptr; // stop subclass from accumulating after destroy
+    g_presenterForInput  = nullptr;
+    g_gameHwndForForward = nullptr;
     m_backBuffer.Reset();
     m_leftSurface.Reset();  m_rightSurface.Reset();
     m_sysMemLeft.Reset();   m_sysMemRight.Reset();

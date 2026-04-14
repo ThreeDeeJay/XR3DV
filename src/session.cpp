@@ -367,7 +367,7 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
         m_presenter.ConsumeDelta(dx, dy, recenter);
 
         // Wheel → FOV. Each standard detent = ±120 units.
-        // Scale: 1 detent = 1° of half-FoV change (matches VRto3D reference).
+        // Scale: 1 detent = 1° of half-FoV change.
         int32_t wheel = m_presenter.ConsumeFovDelta();
         if (wheel != 0) {
             float prevFov = m_presenter.GetFov();
@@ -376,7 +376,7 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
             m_presenter.SetFov(deg);
             m_cfg.fov.store(deg, std::memory_order_relaxed);
             LOG_VERBOSE("Wheel delta=%d: fov %.1f° -> %.1f°", wheel, prevFov, deg);
-            LOG_INFO("FoV adjusted: %.1f°", deg);
+            LOG_INFO("FoV: %.1f°", deg);
         }
     }
 
@@ -390,7 +390,7 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
         if (m_pitch < -kPitchLimit) m_pitch = -kPitchLimit;
     }
 
-    // Build head orientation: yaw around Y (world-up), then pitch around X (local-right)
+    // Build head orientation: yaw around Y (world-up), then pitch around local X
     float hy = sinf(m_yaw   * 0.5f), hw = cosf(m_yaw   * 0.5f);
     float px = sinf(m_pitch * 0.5f), pw = cosf(m_pitch * 0.5f);
     XrQuaternionf qYaw   = {0.f, hy, 0.f, hw};
@@ -403,20 +403,47 @@ XrResult Session::LocateViews(const XrViewLocateInfo* /*info*/,
         XR_VIEW_STATE_POSITION_TRACKED_BIT  |
         XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
 
-    float halfIpd = m_cfg.ipd * 0.5f;
-    // Convert half-FoV from degrees to radians for XrFovf
-    const float kFov = m_presenter.IsInitialised()
-                       ? (m_presenter.GetFov() * 3.14159265f / 180.0f)
-                       : 0.7854f; // 45° fallback if presenter not yet ready
+    // --- Stereo geometry ---
+    // separation [0..100] → half-IPD in metres.
+    // At separation=50 (default) half-IPD = 0.032m → 64mm total, a typical human IPD.
+    // Range: 0 = 0mm (mono), 100 = 100mm (wide).
+    // This directly controls how far apart the two eye cameras are placed,
+    // which is the primary driver of the 3D stereo effect depth.
+    const float halfIpd = (m_cfg.separation.load() / 100.0f) * 0.05f; // 0–50mm half-IPD
+
+    // convergence [0..25] → horizontal frustum toe-in shift in radians.
+    // Positive convergence shifts the zero-parallax plane closer to the camera,
+    // making objects at that distance appear "on screen" with zero parallax.
+    // Implemented as an asymmetric FoV shift (screen-space convergence):
+    //   left eye shifts frustum right (+conv), right eye shifts left (-conv).
+    const float convRad = (m_cfg.convergence.load() / 25.0f) * 0.2f; // 0–0.2 rad (~0–11°)
+
+    // FoV half-angle in radians
+    const float fovRad = m_presenter.IsInitialised()
+                         ? (m_presenter.GetFov() * 3.14159265f / 180.0f)
+                         : 0.7854f; // 45° fallback
+
+    LOG_VERBOSE("LocateViews: halfIpd=%.4fm convRad=%.4f fovRad=%.4f",
+                halfIpd, convRad, fovRad);
 
     for (int eye = 0; eye < 2; ++eye) {
         views[eye].type = XR_TYPE_VIEW;
         views[eye].next = nullptr;
         views[eye].pose.orientation = headQ;
-        float sign = (eye == 0) ? -1.f : 1.f;
+
+        // Eye position: offset left/right by halfIpd along head X axis
+        const float sign = (eye == 0) ? -1.f : 1.f;
         XrVector3f localOffset = {sign * halfIpd, 0.f, 0.f};
         views[eye].pose.position = QRotate(headQ, localOffset);
-        views[eye].fov = {-kFov, kFov, kFov, -kFov};
+
+        // Asymmetric frustum: shift inner edges inward by convRad to create
+        // a toe-in convergence effect. Left eye (+conv on right edge, right eye (-conv).
+        // angleLeft/Right are negative/positive half-angles from centre.
+        const float innerShift = sign * convRad; // + for left eye, - for right eye
+        views[eye].fov.angleLeft  = -(fovRad + innerShift);
+        views[eye].fov.angleRight =  (fovRad - innerShift);
+        views[eye].fov.angleUp    =  fovRad;
+        views[eye].fov.angleDown  = -fovRad;
     }
     return XR_SUCCESS;
 }
