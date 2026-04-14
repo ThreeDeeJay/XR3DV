@@ -98,6 +98,7 @@ jobs:
       shell: cmd
       run: |
         If exist "vcpkg\installed\${{env.Platform}}-windows\bin\*.dll" (copy "vcpkg\installed\${{env.Platform}}-windows\bin\*.dll" "${{env.Artifacts}}")
+        move "${{env.Artifacts}}\xr3dv.ini.example" "${{env.Artifacts}}\xr3dv.ini"
  
     - name: List files
       run: ls -R
