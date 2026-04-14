@@ -16,13 +16,13 @@ HalfRate=true
 [Stereo]
 ; Eye separation [0–100%]
 ;   Ctrl+F3 decrease  /  Ctrl+F4 increase  (hold for continuous adjustment)
-Separation=50.0
+Separation=100.0
 
 ; Convergence [0–25]
 ;   Ctrl+F5 decrease  /  Ctrl+F6 increase  (hold for continuous adjustment)
 ;   This value is bidirectionally linked to the native 3D Vision OSD —
 ;   adjusting via 3DV hardware buttons will update this value automatically.
-Convergence=5.000
+Convergence=3.000
 
 ; Ctrl+F7 = save current separation/convergence/fov to the per-game xr3dv.ini
 
